@@ -13,6 +13,11 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <atomic>
+#include <cstring>
+#include <string>
+#include <fmt/format.h>
+#include <rex/system/xmemory.h>
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -34,9 +39,37 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+static void DumpGuestWords(const char* what, uint8_t* base, uint32_t addr, uint32_t words) {
+  if (!base || addr < 0x10000 || addr >= 0xA0000000u) {
+    REXSYS_ERROR("  {} @0x{:08X}: (not dumped)", what, addr);
+    return;
+  }
+  std::string line;
+  for (uint32_t i = 0; i < words; ++i) {
+    uint32_t v;
+    std::memcpy(&v, rex::memory::GuestPtr<const uint8_t*>(base, addr + i * 4), 4);
+    v = __builtin_bswap32(v);
+    line += fmt::format(" {:08X}", v);
+  }
+  REXSYS_ERROR("  {} @0x{:08X}:{}", what, addr, line);
+}
+
+static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
+  DumpGuestWords("r31 object", base, ctx.r31.u32, 24);
+  DumpGuestWords("r31+20 target", base, ctx.r11.u32, 8);
+  DumpGuestWords("r10 object", base, ctx.r10.u32, 8);
+  {
+    uint32_t vt;
+    std::memcpy(&vt, rex::memory::GuestPtr<const uint8_t*>(base, ctx.r31.u32), 4);
+    DumpGuestWords("vtable of r31", base, __builtin_bswap32(vt), 12);
+  }
+  REX_FATAL(
+      "Call to invalid or unregistered function at guest address 0x{:08X} "
+      "(lr=0x{:08X} ctr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r8=0x{:08X} "
+      "r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} r30=0x{:08X} r31=0x{:08X})",
+      ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr), ctx.ctr.u32, ctx.r1.u32, ctx.r3.u32,
+      ctx.r4.u32, ctx.r5.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, ctx.r11.u32, ctx.r12.u32,
+      ctx.r30.u32, ctx.r31.u32);
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
@@ -386,3 +419,26 @@ std::optional<std::pair<uint32_t, uint32_t>> FunctionDispatcher::UnregisterModul
 }
 
 }  // namespace rex::runtime
+
+// Out-of-line report for conditional tw/td traps (generated ppc_trap types 0/22). The compiler
+// emits them as divide-by-zero guards, which would crash the game on real hardware, so every hit
+// means some emulated value is wrong. host_pc is the return address into the generated function:
+// ELF address = host_pc - anchor + (ELF address of rex_ppc_trap_report), then addr2line gives the
+// sub_XXXXXXXX and the generated source line (whose comment has the guest instruction).
+__attribute__((noinline)) void rex_ppc_trap_report(PPCContext& ctx, uint16_t trap_type) {
+  static std::atomic<uint32_t> hits{0};
+  const uint32_t n = hits.fetch_add(1, std::memory_order_relaxed);
+  if (n >= 256 && (n % 1024) != 0) {
+    return;
+  }
+  REXSYS_WARN(
+      "tw/td trap hit #{} (type {}): host_pc=0x{:X} anchor=0x{:X} lr=0x{:08X} r1=0x{:08X} "
+      "r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} "
+      "r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} r28=0x{:08X} r29=0x{:08X} r30=0x{:08X} "
+      "r31=0x{:08X}",
+      n, trap_type, reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
+      reinterpret_cast<uintptr_t>(&rex_ppc_trap_report), static_cast<uint32_t>(ctx.lr),
+      ctx.r1.u32, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
+      ctx.r9.u32, ctx.r10.u32, ctx.r11.u32, ctx.r12.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32,
+      ctx.r31.u32);
+}

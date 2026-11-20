@@ -1592,10 +1592,12 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           }
           break;
         case SurfacePaintConnectResult::kFailure:
+          REXLOG_WARN("Presenter: surface (re)connection failed, waiting for a surface change");
           surface_paint_connection_state_ =
               SurfacePaintConnectionState::kUnconnectedRetryAtStateChange;
           break;
         case SurfacePaintConnectResult::kFailureSurfaceUnusable:
+          REXLOG_WARN("Presenter: surface reported unusable");
           surface_paint_connection_state_ =
               SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable;
           break;
@@ -1700,6 +1702,34 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+#if REX_PLATFORM_SWITCH2
+  {
+    // Present diagnostics: log a summary every 5 s whenever anything but kPresented happened.
+    static uint32_t counts[8] = {};
+    static auto window_start = std::chrono::steady_clock::now();
+    ++counts[std::min<uint32_t>(uint32_t(result), 7)];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start >= std::chrono::seconds(5)) {
+      uint32_t others = 0;
+      for (uint32_t i = 0; i < 8; ++i) {
+        if (i != uint32_t(PaintResult::kPresented)) others += counts[i];
+      }
+      if (others) {
+        REXLOG_INFO("Presenter: results in 5 s: presented={} suboptimal={} outdated={} "
+                    "not_presented={} other={}",
+                    counts[uint32_t(PaintResult::kPresented)],
+                    counts[uint32_t(PaintResult::kPresentedSuboptimal)],
+                    counts[uint32_t(PaintResult::kNotPresentedConnectionOutdated)],
+                    counts[uint32_t(PaintResult::kNotPresented)],
+                    others - counts[uint32_t(PaintResult::kPresentedSuboptimal)] -
+                        counts[uint32_t(PaintResult::kNotPresentedConnectionOutdated)] -
+                        counts[uint32_t(PaintResult::kNotPresented)]);
+      }
+      std::fill(std::begin(counts), std::end(counts), 0u);
+      window_start = now;
+    }
+  }
+#endif
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

@@ -14,7 +14,10 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_SWITCH2
+#include <cstdint>
+#include <vector>
+#elif REX_PLATFORM_LINUX
 #include <ucontext.h>
 #include <cstdint>
 #include <vector>
@@ -54,6 +57,20 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
+#elif REX_PLATFORM_SWITCH2
+  // AArch64 callee-saved state: x19-x30, sp, d8-d15 (see fiber_switch2.cpp).
+  struct Context {
+    uint64_t x[12];
+    uint64_t sp;
+    uint64_t d[8];
+  };
+  alignas(16) Context context_{};
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+
+  static void Trampoline();
 #elif REX_PLATFORM_LINUX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;

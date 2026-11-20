@@ -46,6 +46,11 @@ if(WIN32)
         threading_win.cpp
     )
 elseif(UNIX)
+    # PC test of the Switch 2 memory model: one flat arena + folded aliases.
+    set(REX_MEMORY_IMPL memory_posix.cpp)
+    if(REX_SIM_ARENA)
+        set(REX_MEMORY_IMPL ${REX_SIM_MEMORY_FILE})
+    endif()
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
         clock_posix.cpp
@@ -56,7 +61,7 @@ elseif(UNIX)
         fiber_posix.cpp
         mapped_memory_posix.cpp
         math_gcc.cpp
-        memory_posix.cpp
+        ${REX_MEMORY_IMPL}
         seh_posix.cpp
         socket_posix.cpp
         string_posix.cpp

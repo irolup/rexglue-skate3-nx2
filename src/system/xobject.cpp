@@ -27,7 +27,108 @@
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <fmt/format.h>
+#include <rex/logging.h>
+#include <rex/platform.h>
+
 namespace rex::system {
+
+#if REX_PLATFORM_SWITCH2
+void CheckKernelDispatchHealth();  // kernel_state.cpp
+// Long-wait report (diagnostics for hangs where every thread sits in a wait): each guest thread
+// records the objects it waits on in a thread-local slot; a monitor thread logs every wait that
+// lasts more than 5 s (once per wait), with the waiting thread and the object types/handles.
+namespace {
+struct WaitSlot {
+  std::atomic<uint64_t> start_ms{0};  // 0 = not waiting
+  std::atomic<uint64_t> serial{0};
+  uint32_t thread_id = 0;
+  uint32_t count = 0;
+  uint32_t handles[4] = {};
+  uint32_t types[4] = {};
+  bool infinite = false;
+  bool wait_all = false;
+  uint64_t reported_serial = 0;
+};
+std::mutex g_wait_slots_mutex;
+std::vector<WaitSlot*> g_wait_slots;
+std::atomic<bool> g_wait_monitor_started{false};
+KernelState* g_wait_monitor_kernel_state = nullptr;
+
+void WaitMonitorLoop() {
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    CheckKernelDispatchHealth();
+    const uint64_t now = chrono::Clock::QueryHostUptimeMillis();
+    std::lock_guard<std::mutex> lock(g_wait_slots_mutex);
+    for (WaitSlot* slot : g_wait_slots) {
+      const uint64_t start = slot->start_ms.load(std::memory_order_acquire);
+      const uint64_t serial = slot->serial.load(std::memory_order_acquire);
+      if (!start || start > now || now - start < 5000 || slot->reported_serial == serial) {
+        continue;
+      }
+      slot->reported_serial = serial;
+      std::string what;
+      for (uint32_t i = 0; i < slot->count && i < 4; ++i) {
+        what += fmt::format(" {}:{:08X}", slot->types[i], slot->handles[i]);
+      }
+      std::string thread_name = "?";
+      if (g_wait_monitor_kernel_state) {
+        auto thread = g_wait_monitor_kernel_state->GetThreadByID(slot->thread_id);
+        if (thread) {
+          thread_name = thread->name();
+        }
+      }
+      REXKRNL_WARN("Long wait: thread {} '{}' waiting {} ms on {} object(s) ({}{}){}",
+                   slot->thread_id, thread_name, now - start, slot->count,
+                   slot->wait_all ? "all" : "any", slot->infinite ? ", no timeout" : "", what);
+    }
+  }
+}
+
+WaitSlot& CurrentWaitSlot(KernelState* kernel_state) {
+  thread_local WaitSlot* slot = nullptr;
+  if (!slot) {
+    slot = new WaitSlot();  // lives as long as the process (threads are few)
+    if (XThread* thread = XThread::GetCurrentThread()) {
+      slot->thread_id = thread->thread_id();
+    }
+    std::lock_guard<std::mutex> lock(g_wait_slots_mutex);
+    g_wait_slots.push_back(slot);
+  }
+  if (!g_wait_monitor_started.exchange(true)) {
+    g_wait_monitor_kernel_state = kernel_state;
+    std::thread(WaitMonitorLoop).detach();
+  }
+  return *slot;
+}
+
+struct ScopedWaitRecord {
+  WaitSlot& slot;
+  ScopedWaitRecord(KernelState* kernel_state, XObject* const* objects, uint32_t count,
+                   bool wait_all, bool infinite)
+      : slot(CurrentWaitSlot(kernel_state)) {
+    slot.count = count;
+    for (uint32_t i = 0; i < count && i < 4; ++i) {
+      slot.handles[i] = objects[i]->handle();
+      slot.types[i] = uint32_t(objects[i]->type());
+    }
+    slot.wait_all = wait_all;
+    slot.infinite = infinite;
+    slot.serial.fetch_add(1, std::memory_order_release);
+    slot.start_ms.store(chrono::Clock::QueryHostUptimeMillis() | 1, std::memory_order_release);
+  }
+  ~ScopedWaitRecord() { slot.start_ms.store(0, std::memory_order_release); }
+};
+}  // namespace
+#define REX_RECORD_WAIT(ks, objs, n, all, infinite) \
+  ScopedWaitRecord wait_record_(ks, objs, n, all, infinite)
+#else
+#define REX_RECORD_WAIT(ks, objs, n, all, infinite) ((void)0)
+#endif
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -212,6 +313,8 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  XObject* self = this;
+  REX_RECORD_WAIT(kernel_state(), &self, 1, false, !opt_timeout);
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
@@ -270,6 +373,8 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  REX_RECORD_WAIT(count ? objects[0]->kernel_state() : nullptr, objects, count, !wait_type,
+                  !opt_timeout);
   if (wait_type) {
     auto result =
         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);

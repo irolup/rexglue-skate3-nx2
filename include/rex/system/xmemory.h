@@ -59,7 +59,11 @@ const PhysicalMemoryInvalidationDiagnostics& GetPhysicalMemoryInvalidationDiagno
 /// Same raw arithmetic as recompiled code; no Memory* or heap lookup needed.
 template <typename T = u8*>
 inline T GuestPtr(u8* base, u32 guest_address) noexcept {
+#if REX_ARENA_MEMORY
+  return reinterpret_cast<T>(base + guest_address + rex_s2_fold_delta(guest_address));
+#else
   return reinterpret_cast<T>(base + guest_address + detail::PhysicalHostOffset(guest_address));
+#endif
 }
 
 class Memory;
@@ -157,6 +161,12 @@ class BaseHeap {
 
   template <typename T = uint8_t*>
   inline T TranslateRelative(size_t relative_address) const {
+#if REX_ARENA_MEMORY
+    if (fold_) {
+      const uint32_t guest = uint32_t(heap_base_ + relative_address);
+      return reinterpret_cast<T>(membase_ + guest + rex_s2_fold_delta(guest));
+    }
+#endif
     return reinterpret_cast<T>(membase_ + heap_base_ + host_address_offset_ + relative_address);
   }
 
@@ -239,6 +249,7 @@ class BaseHeap {
 
   memory::Memory* memory_;
   uint8_t* membase_;
+  bool fold_ = false;  // Switch 2: membase_ is the guest-virtual arena base
   HeapType heap_type_;
   uint32_t heap_base_;
   uint32_t heap_size_;
@@ -356,6 +367,9 @@ class Memory {
   // Note that the contents at the specified host address are big-endian.
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) const {
+#if REX_ARENA_MEMORY
+    return reinterpret_cast<T>(virtual_membase_ + guest_address + rex_s2_fold_delta(guest_address));
+#endif
     uint8_t* host_address = virtual_membase_ + guest_address;
     const auto heap = LookupHeap(guest_address);
     if (heap) {
@@ -544,6 +558,7 @@ class Memory {
   uint32_t system_page_size_ = 0;
   uint32_t system_allocation_granularity_ = 0;
   uint8_t* virtual_membase_ = nullptr;
+  uint8_t* switch2_arena_ = nullptr;
   uint8_t* physical_membase_ = nullptr;
 
   struct FunctionTableEntry {

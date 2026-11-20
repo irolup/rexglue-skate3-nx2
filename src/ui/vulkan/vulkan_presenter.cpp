@@ -46,6 +46,9 @@
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
 #endif
+#if REX_PLATFORM_SWITCH2
+#include <rex/ui/surface_switch2.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
@@ -514,6 +517,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     type_flags |= Surface::kTypeFlag_Win32Hwnd;
   }
 #endif
+#ifdef VK_USE_PLATFORM_VI_NN
+  if (instance_extensions.ext_NN_vi_surface) {
+    type_flags |= Surface::kTypeFlag_Switch2Vi;
+  }
+#endif
   return type_flags;
 }
 
@@ -912,6 +920,16 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
       } break;
 #endif
+#ifdef VK_USE_PLATFORM_VI_NN
+      case Surface::kTypeIndex_Switch2Vi: {
+        auto& vi_surface = static_cast<const Switch2ViSurface&>(new_surface);
+        VkViSurfaceCreateInfoNN surface_create_info = {};
+        surface_create_info.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
+        surface_create_info.window = vi_surface.nwindow();
+        vulkan_surface_create_result = ifn.vkCreateViSurfaceNN(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
 #if REX_PLATFORM_MAC
       case Surface::kTypeIndex_SDLMetalView: {
         auto& sdl_metal_surface = static_cast<const SDLMetalViewSurface&>(new_surface);
@@ -1184,7 +1202,20 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   //  include in the first synchronization scope all commands that occur earlier
   //  in submission order."
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  {
+  if (vulkan_device_->ordered_submission_enabled()) {
+    // The refresher's commands may still be queued for ordered submission: queue the signal
+    // behind them instead of blocking here until they reach the queue.
+    VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
+        guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
+    VkFence fence = fence_acqusition.fence();
+    const VulkanDevice* vulkan_device = vulkan_device_;
+    uint64_t ticket = vulkan_device_->SubmitOrdered([vulkan_device, fence]() {
+      const VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      vulkan_device->functions().vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence);
+    });
+    guest_output_image_refresher_submission_tracker_.SetOrderedTicketForCurrentSubmission(ticket);
+  } else {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
     const VulkanDevice::Queue::Acquisition queue_acquisition =
@@ -1238,9 +1269,21 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   image_extent.height = std::min(std::max(std::min(height, max_framebuffer_extent.height),
                                           surface_capabilities.minImageExtent.height),
                                  surface_capabilities.maxImageExtent.height);
+  REXLOG_INFO(
+      "VulkanPresenter: surface caps: images {}..{}, current {}x{}, min {}x{}, max {}x{}, "
+      "transforms 0x{:X}, composite alpha 0x{:X}, usage 0x{:X}; requested {}x{}",
+      surface_capabilities.minImageCount, surface_capabilities.maxImageCount,
+      surface_capabilities.currentExtent.width, surface_capabilities.currentExtent.height,
+      surface_capabilities.minImageExtent.width, surface_capabilities.minImageExtent.height,
+      surface_capabilities.maxImageExtent.width, surface_capabilities.maxImageExtent.height,
+      uint32_t(surface_capabilities.supportedTransforms),
+      uint32_t(surface_capabilities.supportedCompositeAlpha),
+      uint32_t(surface_capabilities.supportedUsageFlags), width, height);
   if (!image_extent.width || !image_extent.height ||
       image_extent.width > max_framebuffer_extent.width ||
       image_extent.height > max_framebuffer_extent.height) {
+    REXLOG_ERROR("VulkanPresenter: unusable swapchain extent {}x{}", image_extent.width,
+                 image_extent.height);
     return VK_NULL_HANDLE;
   }
 
@@ -1273,6 +1316,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     }
   }
   if (queue_family_index_present == UINT32_MAX) {
+    REXLOG_ERROR("VulkanPresenter: no queue family can present to this surface");
     // Not unusable though - may become presentable if the window (with the same
     // surface) moved to a different display, for instance.
     return VK_NULL_HANDLE;
@@ -1322,9 +1366,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   static const VkFormat kFormat8888Primary = VK_FORMAT_B8G8R8A8_UNORM;
   static const VkFormat kFormat8888Secondary = VK_FORMAT_R8G8B8A8_UNORM;
 #endif
+  for (const VkSurfaceFormatKHR& sf : surface_formats) {
+    REXLOG_INFO("VulkanPresenter: surface format {} color space {}", uint32_t(sf.format),
+                uint32_t(sf.colorSpace));
+  }
   VkSurfaceFormatKHR image_format;
+  // Any format is allowed only when the implementation lists nothing, or a single UNDEFINED entry.
+  // (A lone real format must be used as is: the console's driver lists only R8G8B8A8.)
   if (surface_formats.empty() ||
-      (surface_formats.size() == 1 || surface_formats[0].format == VK_FORMAT_UNDEFINED)) {
+      (surface_formats.size() == 1 && surface_formats[0].format == VK_FORMAT_UNDEFINED)) {
     // Can choose any format if the implementation specifies only UNDEFINED.
     image_format.format = kFormat8888Primary;
     image_format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -1473,7 +1523,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
+#if REX_PLATFORM_SWITCH2
+  // OunceVK/NVK on the console: mailbox creation fails (VK_ERROR_INITIALIZATION_FAILED); FIFO is
+  // the mode that works there (vsynced).
+  constexpr bool allow_immediate_present_mode = false;
+  swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  if (false)
+#else
   constexpr bool allow_immediate_present_mode = true;
+#endif
   if (allow_immediate_present_mode && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
@@ -1498,9 +1556,65 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
-  VkSwapchainKHR swapchain;
-  if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
-    REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
+  VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+#if REX_PLATFORM_SWITCH2
+  // The console's driver (NVK WSI over VK_NN_vi_surface) rejects some parameter combinations
+  // with VK_ERROR_INITIALIZATION_FAILED. Try a series of variants and keep the first that works;
+  // every attempt is logged so the working one can be made the default.
+  VkResult swapchain_create_result = VK_ERROR_INITIALIZATION_FAILED;
+  {
+    struct Variant {
+      const char* name;
+      VkImageUsageFlags usage;
+      VkCompositeAlphaFlagBitsKHR alpha;
+      VkPresentModeKHR mode;
+      bool use_old_swapchain;
+    };
+    const VkImageUsageFlags kColor = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    const VkImageUsageFlags kPlume = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const VkImageUsageFlags kSupported = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const Variant variants[] = {
+        {"plume-usage FIFO", kPlume, swapchain_create_info.compositeAlpha, VK_PRESENT_MODE_FIFO_KHR, false},
+        {"color-only FIFO", kColor, swapchain_create_info.compositeAlpha, VK_PRESENT_MODE_FIFO_KHR, false},
+        {"supported-usage FIFO", kSupported, swapchain_create_info.compositeAlpha, VK_PRESENT_MODE_FIFO_KHR, false},
+        {"plume-usage MAILBOX", kPlume, swapchain_create_info.compositeAlpha, VK_PRESENT_MODE_MAILBOX_KHR, false},
+        {"plume-usage FIFO inherit-alpha", kPlume, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR, VK_PRESENT_MODE_FIFO_KHR, false},
+        {"plume-usage IMMEDIATE", kPlume, swapchain_create_info.compositeAlpha, VK_PRESENT_MODE_IMMEDIATE_KHR, false},
+    };
+    for (const Variant& v : variants) {
+      VkSwapchainCreateInfoKHR info = swapchain_create_info;
+      info.imageUsage = v.usage;
+      info.compositeAlpha = v.alpha;
+      info.presentMode = v.mode;
+      swapchain_create_result = dfn.vkCreateSwapchainKHR(device, &info, nullptr, &swapchain);
+      REXLOG_INFO("VulkanPresenter: swapchain variant '{}' -> VkResult {}", v.name,
+                  int32_t(swapchain_create_result));
+      if (swapchain_create_result == VK_SUCCESS) {
+        swapchain_create_info = info;
+        break;
+      }
+    }
+  }
+#else
+  const VkResult swapchain_create_result =
+      dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain);
+#endif
+  if (swapchain_create_result != VK_SUCCESS) {
+    REXLOG_ERROR(
+        "VulkanPresenter: Failed to create a swapchain: VkResult {} (images {}, format {}, "
+        "colorspace {}, extent {}x{}, usage 0x{:X}, transform 0x{:X}, alpha 0x{:X}, mode {}, "
+        "sharing {}, old swapchain {}, {} surface formats, {} present modes)",
+        int32_t(swapchain_create_result), swapchain_create_info.minImageCount,
+        uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
+        swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
+        uint32_t(swapchain_create_info.imageUsage), uint32_t(swapchain_create_info.preTransform),
+        uint32_t(swapchain_create_info.compositeAlpha), uint32_t(swapchain_create_info.presentMode),
+        uint32_t(swapchain_create_info.imageSharingMode),
+        old_swapchain != VK_NULL_HANDLE ? "yes" : "no", surface_formats.size(),
+        present_modes.size());
     return VK_NULL_HANDLE;
   }
   REXLOG_INFO(

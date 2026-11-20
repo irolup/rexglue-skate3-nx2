@@ -30,6 +30,8 @@ class DeferredCommandBuffer {
 
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
+  // Exchanges the recorded commands with another buffer (for asynchronous submission).
+  void SwapStream(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,

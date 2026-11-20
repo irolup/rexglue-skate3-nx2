@@ -30,6 +30,8 @@
 #include <rex/string/util.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/kernel_module.h>
+#include <thread>
+#include <atomic>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/guest_path.h>
@@ -41,6 +43,36 @@
 #include <rex/system/xthread.h>
 
 namespace rex::system {
+
+#if REX_PLATFORM_SWITCH2
+// Kernel dispatch diagnostics (file-local: kernel_state.h is included by generated code).
+namespace {
+std::atomic<uint64_t> g_dispatch_heartbeat{0};
+std::atomic<uint64_t> g_dispatch_queued_since_ms{0};
+std::atomic<int64_t> g_dispatch_pending{0};
+std::atomic<bool> g_dispatch_thread_exists{false};
+}  // namespace
+
+// Called every 2 s by the long-wait monitor (xobject.cpp).
+void CheckKernelDispatchHealth() {
+  const uint64_t since = g_dispatch_queued_since_ms.load(std::memory_order_relaxed);
+  if (!since) {
+    return;
+  }
+  const uint64_t now = chrono::Clock::QueryHostUptimeMillis();
+  if (now - since < 2000) {
+    return;
+  }
+  static uint64_t last_heartbeat = 0;
+  const uint64_t heartbeat = g_dispatch_heartbeat.load(std::memory_order_relaxed);
+  REXSYS_WARN("Dispatch queue stalled: {} item(s) pending for {} ms, dispatch heartbeat {} ({}), "
+              "dispatch thread {}",
+              g_dispatch_pending.load(), now - since, heartbeat,
+              heartbeat != last_heartbeat ? "moving" : "STUCK",
+              g_dispatch_thread_exists.load() ? "exists" : "MISSING");
+  last_heartbeat = heartbeat;
+}
+#endif
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 
@@ -588,19 +620,45 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
       auto global_lock = global_critical_region_.AcquireDeferred();
       while (dispatch_thread_running_) {
+#if REX_PLATFORM_SWITCH2
+        // Switch 2: no condition_variable_any (its wakeup was lost with the global recursive mutex
+        // on libounce: XamShowDeviceSelectorUI's completion never ran and the game hung after
+        // Start). Poll the queue under the global lock; sleep 1 ms when it is empty.
+        g_dispatch_heartbeat.fetch_add(1, std::memory_order_relaxed);
         global_lock.lock();
         if (dispatch_queue_.empty()) {
-          dispatch_cond_.wait(global_lock);
+          global_lock.unlock();
           if (!dispatch_thread_running_) {
-            global_lock.unlock();
             break;
           }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
         }
+#else
+        global_lock.lock();
+        while (dispatch_queue_.empty() && dispatch_thread_running_) {
+          dispatch_cond_.wait(global_lock);
+        }
+        if (!dispatch_thread_running_) {
+          global_lock.unlock();
+          break;
+        }
+#endif
         auto fn = std::move(dispatch_queue_.front());
         dispatch_queue_.pop_front();
         REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",
                            dispatch_queue_.size());
         global_lock.unlock();
+#if REX_PLATFORM_SWITCH2
+        g_dispatch_pending.fetch_sub(1, std::memory_order_relaxed);
+        g_dispatch_queued_since_ms.store(0, std::memory_order_relaxed);
+        {
+          static uint32_t logged = 0;
+          if (++logged <= 50) {
+            REXSYS_INFO("Dispatch thread: running queued item #{}", logged);
+          }
+        }
+#endif
 
         // Throws out of fn leave the originating overlapped uncompleted and
         // the waiting guest thread stuck; fail visibly rather than swallow.
@@ -617,6 +675,10 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     }));
     dispatch_thread_->set_name("Kernel Dispatch");
     X_STATUS create_status = dispatch_thread_->Create();
+#if REX_PLATFORM_SWITCH2
+    g_dispatch_thread_exists = !XFAILED(create_status);
+    REXSYS_INFO("Kernel Dispatch thread created (status {:08X})", create_status);
+#endif
     if (XFAILED(create_status)) {
       dispatch_thread_running_ = false;
       dispatch_thread_.reset();
@@ -1148,8 +1210,20 @@ void KernelState::CompleteOverlappedDeferredEx(
           post_callback();
         }
       });
+#if REX_PLATFORM_SWITCH2
+  g_dispatch_pending.fetch_add(1, std::memory_order_relaxed);
+  if (!g_dispatch_queued_since_ms.load(std::memory_order_relaxed)) {
+    g_dispatch_queued_since_ms.store(chrono::Clock::QueryHostUptimeMillis() | 1,
+                                     std::memory_order_relaxed);
+  }
+  REXSYS_INFO("CompleteOverlappedDeferredEx: queued overlapped {:08X} (queue size {}, dispatch "
+              "heartbeat {}, thread {})",
+              overlapped_ptr, dispatch_queue_.size(), g_dispatch_heartbeat.load(),
+              dispatch_thread_ ? "exists" : "MISSING");
+#endif
   dispatch_cond_.notify_all();
 }
+
 
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {
   auto* thread = XThread::GetCurrentThread();

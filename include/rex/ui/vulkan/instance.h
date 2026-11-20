@@ -67,6 +67,10 @@ class VulkanInstance {
 #ifdef VK_USE_PLATFORM_WIN32_KHR
 #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
 #endif
+    // VK_NN_vi_surface (#63)
+#ifdef VK_USE_PLATFORM_VI_NN
+#include <rex/ui/vulkan/functions/instance_nn_vi_surface.inc>
+#endif
     // VK_EXT_metal_surface (#218)
 #ifdef VK_USE_PLATFORM_METAL_EXT
 #include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
@@ -95,6 +99,9 @@ class VulkanInstance {
 #endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
     bool ext_KHR_win32_surface = false;  // #10
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+    bool ext_NN_vi_surface = false;  // #63
 #endif
 #ifdef VK_USE_PLATFORM_METAL_EXT
     bool ext_EXT_metal_surface = false;  // #218

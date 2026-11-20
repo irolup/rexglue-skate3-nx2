@@ -276,6 +276,14 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // Host time (ms) of the last software revalidation of the guest pages (only used with
+    // gpu_revalidate_guest_memory, i.e. without write-fault tracking).
+    uint32_t last_revalidate_ms() const { return last_revalidate_ms_; }
+    void set_last_revalidate_ms(uint32_t ms) { last_revalidate_ms_ = ms; }
+    // Host time (ms) the revalidation last found the texture's memory changed (0 = never).
+    uint32_t last_change_ms() const { return last_change_ms_; }
+    void set_last_change_ms(uint32_t ms) { last_change_ms_ = ms; }
+
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
     explicit Texture(TextureCache& texture_cache, const TextureKey& key, bool track_usage = true);
@@ -300,6 +308,8 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    uint32_t last_revalidate_ms_ = 0;
+    uint32_t last_change_ms_ = 0;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -578,6 +588,11 @@ class TextureCache {
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
   void ResetTextureBindings(bool from_destructor = false);
+
+  // Without write-fault tracking, CPU writes into the memory of an already loaded texture (FMV
+  // frames written through Texture::Lock, glyph caches) would never be noticed: re-hash its pages
+  // through the shared memory, which marks it outdated via the watch if they changed.
+  void RevalidateTexture(Texture* texture, uint32_t now_ms);
 
   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
     const TextureBinding& binding = texture_bindings_[fetch_constant_index];

@@ -127,28 +127,55 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
   }
 
   worker_running_ = true;
+  worker_kernel_state_ = kernel_state;
+  CreateWorkerThread();
+
+  return X_STATUS_SUCCESS;
+}
+
+void AudioSystem::CreateWorkerThread() {
   worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state, 128 * 1024, 0, [this]() {
+      new system::XHostThread(worker_kernel_state_, 128 * 1024, 0, [this]() {
         WorkerThreadMain();
         return 0;
       }));
 
   worker_thread_->set_name("Audio Worker");
-  worker_thread_->Create();
+  X_STATUS create_status = worker_thread_->Create();
   if (worker_thread_->thread()) {
     worker_thread_->thread()->set_priority(AudioWorkerNativePriority());
   }
+  REXAPU_INFO("Audio Worker: thread created (status {:08X}, host thread {})", create_status,
+              worker_thread_->thread() ? "ok" : "MISSING");
+}
 
-  return X_STATUS_SUCCESS;
+void AudioSystem::EnsureWorkerAlive(const char* reason) {
+  if (!worker_running_) {
+    return;
+  }
+  if (worker_alive_.load()) {
+    static uint64_t last_reported_heartbeat = UINT64_MAX;
+    const uint64_t heartbeat = worker_heartbeat_.load();
+    if (heartbeat != last_reported_heartbeat) {
+      last_reported_heartbeat = heartbeat;
+      REXAPU_WARN("Audio Worker: running but no audio ({}), heartbeat {}", reason, heartbeat);
+    }
+    return;
+  }
+  REXAPU_ERROR("Audio Worker: not running ({}), creating it again", reason);
+  CreateWorkerThread();
 }
 
 void AudioSystem::WorkerThreadMain() {
+  worker_alive_ = true;
+  REXAPU_INFO("Audio Worker: running");
   // Initialize driver and ringbuffer.
   Initialize();
 
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
+    worker_heartbeat_.fetch_add(1, std::memory_order_relaxed);
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
@@ -226,6 +253,8 @@ void AudioSystem::WorkerThreadMain() {
       rex::thread::Sleep(std::chrono::milliseconds(500));
     }
   }
+  REXAPU_INFO("Audio Worker: exiting (running={})", bool(worker_running_));
+  worker_alive_ = false;
   worker_running_ = false;
 
   // TODO(benvanik): call module API to kill?

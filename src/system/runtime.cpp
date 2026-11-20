@@ -75,10 +75,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   };
 
   // Start profiler (Tracy network threads, counter init)
+  REX_S2_TRACE("Setup: Profiler::Startup");
   rex::perf::Profiler::Startup();
+  REX_S2_TRACE("Setup: initialize_seh");
 
   // Initialize SEH exception support for hardware exception handling
   rex::initialize_seh();
+  REX_S2_TRACE("Setup: clock");
 
   // Initialize clock
   chrono::Clock::set_guest_tick_frequency(50000000);
@@ -91,11 +94,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   tool_mode_ = config.tool_mode;
 
   // Create memory system first
+  REX_S2_TRACE("Setup: Memory");
   memory_ = std::make_unique<memory::Memory>();
   if (!memory_->Initialize()) {
     return fail(X_STATUS_UNSUCCESSFUL, "memory init failed");
   }
 
+  REX_S2_TRACE("Setup: memory ok");
   export_resolver_ = std::make_unique<runtime::ExportResolver>();
 
   function_dispatcher_ =
@@ -103,10 +108,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   REXSYS_INFO("FunctionDispatcher initialized");
 
   // Create virtual file system
+  REX_S2_TRACE("Setup: VFS object");
   file_system_ = std::make_unique<rex::filesystem::VirtualFileSystem>();
 
   // Create kernel state - this sets the global singleton
+  REX_S2_TRACE("Setup: KernelState");
   kernel_state_ = std::make_unique<system::KernelState>(this);
+  REX_S2_TRACE("Setup: KernelState ok");
 
   // Initialize input from injected config
   if (config.input_factory) {
@@ -123,11 +131,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     }
   }
 
+  REX_S2_TRACE("Setup: kernel_init");
   // HLE kernel modules and apps.
   if (config.kernel_init) {
     config.kernel_init(this, kernel_state_.get());
   }
 
+  REX_S2_TRACE("Setup: audio");
   // Initialize the APU (Audio Processing Unit) from injected config
   if (config.audio_factory) {
     audio_system_ = config.audio_factory(function_dispatcher_.get());
@@ -144,6 +154,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   }
 
   // Set up VFS: game_data_root as game:/d:, update_data_root as update:
+  REX_S2_TRACE("Setup: SetupVfs");
   if (!SetupVfs()) {
     return fail(X_STATUS_UNSUCCESSFUL, "VFS setup failed");
   }

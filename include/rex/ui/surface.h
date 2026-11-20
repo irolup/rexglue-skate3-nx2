@@ -35,6 +35,8 @@ class Surface {
     kTypeIndex_Win32Hwnd,
     // macOS.
     kTypeIndex_SDLMetalView,
+    // Nintendo Switch 2 (Horizon NWindow / VK_NN_vi_surface).
+    kTypeIndex_Switch2Vi,
   };
   using TypeFlags = uint32_t;
   enum : TypeFlags {
@@ -42,6 +44,7 @@ class Surface {
     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
     kTypeFlag_SDLMetalView = TypeFlags(1) << kTypeIndex_SDLMetalView,
     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
+    kTypeFlag_Switch2Vi = TypeFlags(1) << kTypeIndex_Switch2Vi,
   };
 
   Surface(const Surface& surface) = delete;

@@ -20,6 +20,10 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <unordered_map>
+#include <fmt/format.h>
+#include <vector>
+#include <string>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -67,15 +71,15 @@ REXCVAR_DEFINE_INT32(anisotropic_override, -1, "GPU",
     .range(-1, 5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 2, "GPU", "Draw resolution scale X (1 = no scaling)")
+REXCVAR_DEFINE_INT32(draw_resolution_scale_x, REX_PLATFORM_SWITCH2 ? 1 : 2, "GPU", "Draw resolution scale X (1 = no scaling)")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 2, "GPU", "Draw resolution scale Y (1 = no scaling)")
+REXCVAR_DEFINE_INT32(draw_resolution_scale_y, REX_PLATFORM_SWITCH2 ? 1 : 2, "GPU", "Draw resolution scale Y (1 = no scaling)")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(resolution_scale, 2, "GPU",
+REXCVAR_DEFINE_INT32(resolution_scale, REX_PLATFORM_SWITCH2 ? 1 : 2, "GPU",
                      "Draw resolution scale for both X and Y axes (same as setting "
                      "draw_resolution_scale_x and draw_resolution_scale_y)")
     .range(1, 8)
@@ -346,10 +350,87 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
+#if REX_PLATFORM_SWITCH2
+namespace {
+// Texture load diagnostics: which textures are (re)loaded and whether a resolve wrote them.
+struct RecentResolve {
+  uint32_t start, end;
+};
+RecentResolve g_recent_resolves[128];
+uint32_t g_recent_resolve_next = 0;
+struct TextureLoadStats {
+  uint64_t count = 0;
+  uint64_t from_resolve = 0;
+  uint64_t from_hash = 0;
+  uint32_t bytes = 0;
+  uint32_t width = 0, height = 0, format = 0;
+};
+std::unordered_map<uint32_t, TextureLoadStats> g_texture_load_stats;
+uint64_t g_texture_load_window_ms = 0;
+}  // namespace
+
+// Called for every texture load (all paths) by the host texture cache.
+void Ns2RecordTextureLoad(uint32_t base, uint32_t size, uint32_t width, uint32_t height,
+                          uint32_t format, bool hash_changed_recently) {
+  size = std::max(size, uint32_t(1));
+  bool from_resolve = false;
+  for (const RecentResolve& r : g_recent_resolves) {
+    if (r.end > r.start && r.start < base + size && base < r.end) {
+      from_resolve = true;
+      break;
+    }
+  }
+  TextureLoadStats& st = g_texture_load_stats[base];
+  ++st.count;
+  st.from_resolve += from_resolve;
+  st.from_hash += hash_changed_recently;
+  st.bytes = size;
+  st.width = width;
+  st.height = height;
+  st.format = format;
+  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+  if (!g_texture_load_window_ms) {
+    g_texture_load_window_ms = now_ms;
+  }
+  if (now_ms - g_texture_load_window_ms >= 5000) {
+    std::vector<std::pair<uint32_t, TextureLoadStats>> sorted(g_texture_load_stats.begin(),
+                                                              g_texture_load_stats.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    uint64_t total = 0, total_resolve = 0, total_hash = 0, total_bytes = 0;
+    for (const auto& e : sorted) {
+      total += e.second.count;
+      total_resolve += e.second.from_resolve;
+      total_hash += e.second.from_hash;
+      total_bytes += uint64_t(e.second.bytes) * e.second.count;
+    }
+    std::string top;
+    for (size_t k = 0; k < sorted.size() && k < 12; ++k) {
+      const auto& e = sorted[k];
+      top += fmt::format(" {:08X}:{}x{}f{}:{}KB n={} res={} hash={}", e.first, e.second.width,
+                         e.second.height, e.second.format, e.second.bytes >> 10, e.second.count,
+                         e.second.from_resolve, e.second.from_hash);
+    }
+    REXGPU_INFO("Texture loads in {} ms: {} loads ({} after a resolve, {} after a detected memory "
+                "change), {} MB, {} textures |{}",
+                uint32_t(now_ms - g_texture_load_window_ms), total, total_resolve, total_hash,
+                uint32_t(total_bytes >> 20), sorted.size(), top);
+    g_texture_load_stats.clear();
+    g_texture_load_window_ms = now_ms;
+  }
+}
+#endif
+
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
   if (length_unscaled == 0) {
     return;
   }
+#if REX_PLATFORM_SWITCH2
+  {
+    const uint32_t start = start_unscaled & 0x1FFFFFFF;
+    g_recent_resolves[g_recent_resolve_next++ % 128] = {start, start + length_unscaled};
+  }
+#endif
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
 
@@ -512,6 +593,22 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
   const auto& regs = register_file();
 
+  // Software write tracking: check the textures bound by the previous draws for CPU writes
+  // before deciding whether the bindings are still in sync (a change resets the bindings below).
+  const bool revalidate = shared_memory().revalidate_enabled();
+  const uint32_t revalidate_now_ms =
+      revalidate ? uint32_t(rex::chrono::Clock::QueryHostUptimeMillis()) : 0;
+  if (revalidate) {
+    uint32_t revalidate_index = 0;
+    uint32_t revalidate_mask = used_texture_mask;
+    while (rex::bit_scan_forward(revalidate_mask, &revalidate_index)) {
+      revalidate_mask &= ~(UINT32_C(1) << revalidate_index);
+      const TextureBinding& binding = texture_bindings_[revalidate_index];
+      RevalidateTexture(binding.texture, revalidate_now_ms);
+      RevalidateTexture(binding.texture_signed, revalidate_now_ms);
+    }
+  }
+
   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
@@ -540,6 +637,11 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       if (pending_texture_loads[i].texture == texture) {
         return;
       }
+    }
+    if (revalidate) {
+      // A cached texture that is bound again (e.g. one of several FMV frame buffers) may have
+      // been rewritten by the CPU since it was last loaded.
+      RevalidateTexture(texture, revalidate_now_ms);
     }
     PendingTextureLoad pending_load;
     PendingSharedMemoryRange pending_ranges[2];
@@ -805,11 +907,23 @@ bool TextureCache::DebugIsTeamProfileBackgroundTexture(const Texture& texture) c
   // Never pay that cost unless one of the team-profile-background debug logs
   // is armed. The draws cvar is defined in the Vulkan command processor, so it
   // is read through the registry rather than REXCVAR_GET.
+#if REX_PLATFORM_SWITCH2
+  // The name lookup ran for every candidate texture view request (~1% of the GPU thread); the
+  // debug logs are armed only through options.txt at startup.
+  static const bool draws_log_armed =
+      rex::cvar::Query<int32_t>("vulkan_debug_log_team_profile_background_draws_remaining") > 0;
+  if (REXCVAR_GET(vulkan_debug_log_team_profile_background_candidates_remaining) <= 0 &&
+      REXCVAR_GET(vulkan_debug_log_team_profile_background_bindings_remaining) <= 0 &&
+      !draws_log_armed) {
+    return false;
+  }
+#else
   if (REXCVAR_GET(vulkan_debug_log_team_profile_background_candidates_remaining) <= 0 &&
       REXCVAR_GET(vulkan_debug_log_team_profile_background_bindings_remaining) <= 0 &&
       rex::cvar::Query<int32_t>("vulkan_debug_log_team_profile_background_draws_remaining") <= 0) {
     return false;
   }
+#endif
   const uint8_t* data = shared_memory().DebugTranslatePhysical(key.base_page << 12);
   const uint32_t sample_length = std::min<uint32_t>(texture.GetGuestBaseSize(), UINT32_C(0x8000));
   if (data == nullptr || sample_length == 0) {
@@ -1520,6 +1634,48 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
+  }
+}
+
+REXCVAR_DEFINE_INT32(gpu_revalidate_texture_interval_ms, REX_PLATFORM_SWITCH2 ? 16 : 4, "GPU",
+                     "Minimum time between two software write-tracking checks of the same texture "
+                     "(each check walks all of its pages; 16 ms = about once per frame)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_revalidate_force_ms, 1000, "GPU",
+                     "After a CPU write to a texture's memory is detected, re-check ALL of its pages "
+                     "on every use for this many ms (0 = off). Catches neighbouring blocks that "
+                     "keep their old back-off, but costs a lot of hashing for large textures.")
+    .range(0, 10000);
+
+void TextureCache::RevalidateTexture(Texture* texture, uint32_t now_ms) {
+  if (texture == nullptr) {
+    return;
+  }
+  // The shared memory itself re-hashes a page at most every 4 ms; checking the same texture more
+  // often (many draws per frame) would only cost time: each check walks all of its pages.
+  const uint32_t interval_ms =
+      uint32_t(std::max(1, REXCVAR_GET(gpu_revalidate_texture_interval_ms)));
+  if (texture->last_revalidate_ms() && now_ms - texture->last_revalidate_ms() < interval_ms) {
+    return;
+  }
+  texture->set_last_revalidate_ms(now_ms | 1u);
+  // A texture that changed recently (FMV frames, glyph caches) is likely to change again in parts
+  // that were static so far: check all its pages instead of letting the per-page back-off leave
+  // stale blocks for up to ~0.5 s.
+  const uint32_t force_ms = uint32_t(REXCVAR_GET(gpu_revalidate_force_ms));
+  const bool force =
+      force_ms && texture->last_change_ms() && now_ms - texture->last_change_ms() < force_ms;
+  const TextureKey& key = texture->key();
+  uint32_t changed_pages = 0;
+  if (const uint32_t base_size = texture->GetGuestBaseSize()) {
+    changed_pages += shared_memory().RevalidateRange(key.base_page << 12, base_size, force);
+  }
+  if (const uint32_t mips_size = texture->GetGuestMipsSize()) {
+    changed_pages += shared_memory().RevalidateRange(key.mip_page << 12, mips_size, force);
+  }
+  if (changed_pages) {
+    texture->set_last_change_ms(now_ms | 1u);
   }
 }
 

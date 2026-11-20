@@ -14,6 +14,11 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+#include <rex/cvar.h>
+REXCVAR_DEFINE_BOOL(xmp_broadcast_playback_controller, true, "Kernel",
+                    "Deliver the XMP playback-controller-changed notification to the guest "
+                    "(Skate 3's helper thread crashes on it)");
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -389,7 +394,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     uint32_t(args->playback_client));
 
       playback_client_ = PlaybackClient(uint32_t(args->playback_client));
-      kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
+      if (REXCVAR_GET(xmp_broadcast_playback_controller)) {
+        kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
+      }
       return X_E_SUCCESS;
     }
     case 0x0007001B: {

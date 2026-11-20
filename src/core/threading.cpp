@@ -23,6 +23,9 @@ uint32_t logical_processor_count() {
   static uint32_t value = 0;
   if (!value) {
     value = std::thread::hardware_concurrency();
+    if (!value) {
+      value = 6;  // Horizon reports 0; the Switch 2 has 6 usable cores.
+    }
   }
   return value;
 }

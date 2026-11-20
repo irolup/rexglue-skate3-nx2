@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -150,11 +151,16 @@ Memory::~Memory() {
     mapping_ = rex::memory::kFileMappingHandleInvalid;
   }
 
+#if REX_ARENA_MEMORY
+  std::free(switch2_arena_);
+  switch2_arena_ = nullptr;
+#endif
   virtual_membase_ = nullptr;
   physical_membase_ = nullptr;
 }
 
 bool Memory::Initialize() {
+  REX_S2_TRACE("Memory::Initialize begin");
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
 
   // Create main page file-backed mapping. This is all reserved but
@@ -170,6 +176,20 @@ bool Memory::Initialize() {
     return false;
   }
 
+#if REX_ARENA_MEMORY
+  // Horizon: one flat arena; alias ranges are folded in software (see
+  // rex_s2_fold_delta in platform.h).
+  switch2_arena_ = static_cast<uint8_t*>(std::aligned_alloc(0x10000, (REX_S2_ARENA_SIZE + 0xFFFF) & ~0xFFFFull));
+  if (!switch2_arena_) {
+    REXSYS_ERROR("Unable to allocate the {} MiB guest arena", REX_S2_ARENA_SIZE >> 20);
+    return false;
+  }
+  REX_S2_TRACE("Memory: arena allocated");
+  std::memset(switch2_arena_, 0, REX_S2_ARENA_SIZE);
+  REX_S2_TRACE("Memory: arena zeroed");
+  mapping_base_ = switch2_arena_;
+  views_.all_views[0] = switch2_arena_;
+#else
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
@@ -180,6 +200,7 @@ bool Memory::Initialize() {
       break;
     }
   }
+#endif
 #if REX_PLATFORM_MAC
   if (!mapping_base_) {
     if (!MapViews(nullptr)) {
@@ -193,7 +214,12 @@ bool Memory::Initialize() {
     return false;
   }
   virtual_membase_ = mapping_base_;
+#if REX_ARENA_MEMORY
+  physical_membase_ = mapping_base_ + REX_S2_PHYS_BASE;
+#else
   physical_membase_ = mapping_base_ + 0x100000000ull;
+#endif
+  REX_S2_TRACE("Memory: heaps init");
   // Prepare virtual heaps.
   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
                               0x40000000, 4096);
@@ -251,6 +277,7 @@ bool Memory::Initialize() {
   std::memset(virtual_membase_ + 0x7F000000, 0, 0x01000000);
 #endif
 
+  REX_S2_TRACE("Memory: mmio install");
   // Install MMIO handler for physical address translation and MMIO ranges
   mmio_handler_ = runtime::MMIOHandler::Install(
       virtual_membase_, physical_membase_, physical_membase_ + 0x1FFFFFFF, HostToGuestVirtualThunk,
@@ -275,9 +302,21 @@ bool Memory::Initialize() {
                          memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
                          &unknown_xex_range);
 
+  REX_S2_TRACE("Memory: writing xex constant");
   uint32_t value_to_write = rex::byte_swap(uint32_t(0x2a6e3f38));
+#if REX_ARENA_MEMORY
+  {
+    char buf[200];
+    uint8_t* dst = TranslateVirtual(0x80000000 + 0x1C);
+    std::snprintf(buf, sizeof(buf), "Memory: arena=%p vbase=%p pbase=%p dst=%p", (void*)switch2_arena_,
+                  (void*)virtual_membase_, (void*)physical_membase_, (void*)dst);
+    REX_S2_TRACE(buf);
+  }
+#endif
   std::memcpy(TranslateVirtual(0x80000000 + 0x1C), &value_to_write, sizeof(uint32_t));
+  REX_S2_TRACE("Memory: xex constant written");
 
+  REX_S2_TRACE("Memory::Initialize returning");
   return true;
 }
 
@@ -455,6 +494,12 @@ VirtualHeap* Memory::GetPhysicalHeap() {
 uint32_t Memory::HostToGuestVirtual(const void* host_address) const {
   size_t virtual_address =
       reinterpret_cast<size_t>(host_address) - reinterpret_cast<size_t>(virtual_membase_);
+#if REX_ARENA_MEMORY
+  if (virtual_address >= REX_S2_PHYS_BASE) {
+    return uint32_t(virtual_address - REX_S2_PHYS_BASE);  // physical address
+  }
+  return uint32_t(virtual_address);
+#endif
   uint32_t vE0000000_host_offset = heaps_.vE0000000.host_address_offset();
   size_t vE0000000_host_base = size_t(heaps_.vE0000000.heap_base()) + vE0000000_host_offset;
   if (virtual_address >= vE0000000_host_base &&
@@ -911,6 +956,7 @@ void BaseHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType hea
                           uint32_t host_address_offset) {
   memory_ = memory;
   membase_ = membase;
+  fold_ = memory && memory->virtual_membase() == membase;
   heap_type_ = heap_type;
   heap_base_ = heap_base;
   heap_size_ = heap_size;

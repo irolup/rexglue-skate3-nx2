@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -255,15 +257,34 @@ class VulkanDevice {
 
     explicit Queue(const VkQueue queue) : queue(queue) {}
 
+    // Number of queue acquisitions alive on this thread (any queue). Used by the ordered
+    // submission gate to avoid waiting while this thread already holds a queue.
+    static inline thread_local int acquisition_depth = 0;
+
     class Acquisition {
      public:
-      explicit Acquisition(Queue& queue) : lock_(queue.mutex), queue_(queue.queue) {}
+      explicit Acquisition(Queue& queue) : lock_(queue.mutex), queue_(queue.queue) {
+        ++acquisition_depth;
+      }
+      Acquisition(Acquisition&& other) noexcept
+          : lock_(std::move(other.lock_)), queue_(other.queue_), counted_(other.counted_) {
+        other.counted_ = false;
+      }
+      Acquisition(const Acquisition&) = delete;
+      Acquisition& operator=(const Acquisition&) = delete;
+      Acquisition& operator=(Acquisition&&) = delete;
+      ~Acquisition() {
+        if (counted_) {
+          --acquisition_depth;
+        }
+      }
 
       VkQueue queue() const { return queue_; }
 
      private:
       std::unique_lock<std::recursive_mutex> lock_;
       VkQueue queue_;
+      bool counted_ = true;
     };
 
     Acquisition Acquire() { return Acquisition(*this); }
@@ -283,8 +304,28 @@ class VulkanDevice {
 
   Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
                                   const uint32_t queue_index) const {
+    if (ordered_submission_enabled_.load(std::memory_order_acquire)) {
+      WaitOrderedSubmissionForAcquire();
+    }
     return queue_families()[queue_family_index].queues[queue_index]->Acquire();
   }
+
+  // Ordered asynchronous submission (Switch 2, where vkQueueSubmit blocks ~1 ms in the driver).
+  // Once enabled, closures passed to SubmitOrdered run on one worker thread ("GPU Submit") in
+  // FIFO order. AcquireQueue on any other thread first waits until every queued closure has run,
+  // so queue submission order always equals the order of the calls. Closures may call
+  // AcquireQueue themselves. Without enabling, SubmitOrdered runs the closure inline.
+  void EnableOrderedSubmission() const;
+  bool ordered_submission_enabled() const {
+    return ordered_submission_enabled_.load(std::memory_order_acquire);
+  }
+  // Returns a ticket (0 if the closure ran inline); IsOrderedTicketComplete(ticket) is true once
+  // the closure has finished.
+  uint64_t SubmitOrdered(std::function<void()> closure) const;
+  bool IsOrderedTicketComplete(uint64_t ticket) const;
+  // Waits until all closures queued so far have run (no-op on the worker thread itself).
+  void DrainOrderedSubmission() const;
+  bool IsOrderedSubmissionThread() const;
 
   struct MemoryTypes {
     uint32_t device_local = 0b0;
@@ -297,6 +338,12 @@ class VulkanDevice {
 
  private:
   explicit VulkanDevice(const VulkanInstance* vulkan_instance, VkPhysicalDevice physical_device);
+
+  void WaitOrderedSubmissionForAcquire() const;
+  void ShutdownOrderedSubmission();
+  struct OrderedSubmissionState;
+  mutable std::unique_ptr<OrderedSubmissionState> ordered_submission_;
+  mutable std::atomic<bool> ordered_submission_enabled_{false};
 
   const VulkanInstance* vulkan_instance_ = nullptr;
   VkPhysicalDevice physical_device_ = nullptr;

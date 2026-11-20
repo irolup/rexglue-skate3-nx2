@@ -32,7 +32,11 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
 #include <rex/audio/audio_system.h>
+#if REX_PLATFORM_SWITCH2
+#include <rex/audio/switch2/switch2_audio_system.h>
+#else
 #include <rex/audio/sdl/sdl_audio_system.h>
+#endif
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/system.h>
@@ -42,7 +46,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_SWITCH2
 #include <gnu/libc-version.h>
 #include <sys/utsname.h>
 #endif
@@ -81,7 +85,7 @@ constexpr bool kBlockShaderStorageStartup =
     false;
 #endif
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_SWITCH2
 std::string Trim(std::string value) {
   const auto first = value.find_first_not_of(" \t\r\n");
   if (first == std::string::npos) {
@@ -278,10 +282,13 @@ std::string ReXApp::GetWindowTitle() const {
 }
 
 bool ReXApp::OnInitialize() {
+  REX_S2_TRACE("app: SetupEnvironment");
   if (!SetupEnvironment())
     return false;
+  REX_S2_TRACE("app: SetupPresentation");
   if (!SetupPresentation())
     return false;
+  REX_S2_TRACE("app: presentation ok");
 
   auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
   if (!paths) {
@@ -304,9 +311,12 @@ bool ReXApp::OnInitialize() {
     LaunchModule();
   });
 #else
+  REX_S2_TRACE("app: ConstructRuntime");
   if (!ConstructRuntime(*paths))
     return false;
+  REX_S2_TRACE("app: LaunchModule");
   LaunchModule();
+  REX_S2_TRACE("app: launched");
 #endif
   return true;
 }
@@ -314,6 +324,7 @@ bool ReXApp::OnInitialize() {
 bool ReXApp::SetupEnvironment() {
   // App root, not executable folder: inside a macOS .app bundle the config
   // and logs stay next to the bundle, where users can find them.
+  REX_S2_TRACE("env: GetAppRootFolder");
   auto exe_dir = rex::filesystem::GetAppRootFolder();
   auto config_path = exe_dir / (std::string(GetName()) + ".toml");
 
@@ -321,6 +332,7 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(config_path))
     rex::cvar::LoadConfig(config_path);
 
+  REX_S2_TRACE("env: config loaded");
   toml::table config_table;
   bool has_config_table = false;
   if (std::filesystem::exists(config_path)) {
@@ -387,8 +399,10 @@ bool ReXApp::SetupEnvironment() {
     cache_dir = user_dir / "cache";
   }
 
+  REX_S2_TRACE("env: paths resolved");
   PathConfig path_config{game_dir, user_dir, update_dir, cache_dir, config_path};
   OnConfigurePaths(path_config);
+  REX_S2_TRACE("env: OnConfigurePaths done");
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
   update_data_root_ = path_config.update_data_root;
@@ -413,6 +427,13 @@ bool ReXApp::SetupEnvironment() {
     log_level_str = "trace";
 
   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
+#if REX_PLATFORM_SWITCH2
+  // Bring-up logging (a config file can override these): every file the game opens, kernel and
+  // thread activity.
+  category_levels.emplace("fs", "trace");
+  category_levels.emplace("krnl", "debug");
+  category_levels.emplace("sys", "debug");
+#endif
   auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
@@ -420,8 +441,10 @@ bool ReXApp::SetupEnvironment() {
     log_config.log_dir = (exe_dir / "logs").string();
   }
 
+  REX_S2_TRACE("env: InitLogging");
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
+  REX_S2_TRACE("env: logging ready");
 
   log_sink_ = std::make_shared<rex::LogCaptureSink>();
   rex::AddSink(log_sink_);
@@ -447,7 +470,7 @@ bool ReXApp::SetupEnvironment() {
     REXLOG_INFO("  Update data:    {}", update_data_root_.string());
   }
   REXLOG_INFO("  Cache root:     {}", cache_root_.string());
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_SWITCH2
   LogLinuxRuntimeDiagnostics();
 #endif
 
@@ -493,6 +516,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     runtime_->set_imgui_drawer(imgui_drawer_.get());
   }
 
+  REX_S2_TRACE("app: Runtime::Setup");
   auto status = runtime_->Setup(ppc_info_, std::move(config_));
   if (XFAILED(status)) {
     REXLOG_ERROR("Runtime setup failed: {:08X}", status);
@@ -544,6 +568,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     }
   }
 
+  REX_S2_TRACE("app: LoadXexImage");
   status = runtime_->LoadXexImage(xex_image);
   if (XFAILED(status)) {
     auto msg = fmt::format("Failed to load XEX ({}): {:08X}", xex_image, status);
@@ -605,11 +630,16 @@ bool ReXApp::SetupPresentation() {
     }
   }
 
+  REX_S2_TRACE("present: candidates ready");
   size_t candidate_index = 0;
   if (!candidates.empty()) {
     config_.graphics = candidates[candidate_index].make();
   }
+#if REX_PLATFORM_SWITCH2
+  config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::switch2::Switch2AudioSystem);
+#else
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+#endif
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
 

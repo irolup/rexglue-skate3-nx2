@@ -31,6 +31,9 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <unordered_map>
+#include <fmt/format.h>
+#include <rex/chrono/clock.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -48,6 +51,18 @@ REXCVAR_DEFINE_BOOL(vulkan_direct_resolve_fast32, false, "GPU/Vulkan",
                     "dispatch reading the host render target directly, instead of the render "
                     "target dump -> EDRAM buffer -> copy round trip (requires "
                     "direct_host_resolve)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_rt_transfer_diagnostics, false, "GPU/Vulkan",
+                    "Track per-draw render target clears/takeovers/writes for the 'RT transfers' "
+                    "log line (costs ~1% of the GPU command thread)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_transfer_stencil_bits, true, "GPU/Vulkan",
+                    "Without VK_EXT_shader_stencil_export, copy stencil in render target "
+                    "ownership transfers into depth buffers with 8 per-bit draws. When false, "
+                    "the transferred stencil is only cleared to 0 (much cheaper, wrong if the "
+                    "game reads stencil written before the format/MSAA switch)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_deferred_resolve_clears, false, "GPU/Vulkan",
@@ -85,6 +100,19 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_inexact_rt_transfers, false, "GPU/Vulkan",
 //     "GPU");
 
 namespace rex::graphics::vulkan {
+
+#if REX_PLATFORM_SWITCH2
+// Diagnostics: render targets cleared by a resolve and not bound for drawing since.
+std::unordered_map<const void*, bool> g_rt_cleared_since_draw;
+uint64_t g_transfers_from_cleared = 0;
+// Diagnostics: per render target, serial of the last ownership takeover (transfer into it) and of
+// the last draw that could write it. A transfer whose source wrote nothing since its last
+// takeover only hands back unchanged data.
+uint64_t g_rt_serial = 0;
+std::unordered_map<const void*, uint64_t> g_rt_acquired_serial;
+std::unordered_map<const void*, uint64_t> g_rt_written_serial;
+uint64_t g_transfers_from_unwritten = 0;
+#endif
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1782,6 +1810,31 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
 
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
+#if REX_PLATFORM_SWITCH2
+      if (REXCVAR_GET(vulkan_rt_transfer_diagnostics)) {
+        const std::vector<Transfer>* update_transfers = last_update_transfers();
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          const void* rt = depth_and_color_render_targets[i];
+          if (!rt) {
+            continue;
+          }
+          g_rt_cleared_since_draw[rt] = false;
+          if (!update_transfers[i].empty()) {
+            g_rt_acquired_serial[rt] = ++g_rt_serial;
+          }
+          bool may_write;
+          if (i == 0) {
+            may_write = (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
+                        normalized_depth_control.stencil_enable;
+          } else {
+            may_write = ((normalized_color_mask >> ((i - 1) * 4)) & 0xF) != 0;
+          }
+          if (may_write) {
+            g_rt_written_serial[rt] = ++g_rt_serial;
+          }
+        }
+      }
+#endif
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -4963,6 +5016,96 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   if (transfer_work_needed) {
     command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kRtTransfer);
   }
+#if REX_PLATFORM_SWITCH2
+  // Transfer diagnostics: every 5 s, log the most frequent (source -> destination) ownership
+  // transfer pairs with their counts and EDRAM tiles.
+  {
+    struct PairStats {
+      uint64_t count = 0;
+      uint64_t tiles = 0;
+      uint64_t host_depth = 0;
+    };
+    static std::unordered_map<uint64_t, PairStats> pair_stats;
+    static uint64_t window_start_ms = 0;
+    static uint64_t resolve_clears = 0;
+    if (resolve_clear_needed) {
+      ++resolve_clears;
+      for (uint32_t i = 0; i < render_target_count && REXCVAR_GET(vulkan_rt_transfer_diagnostics);
+           ++i) {
+        if (render_targets[i]) {
+          g_rt_cleared_since_draw[render_targets[i]] = true;
+        }
+      }
+    }
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (!render_targets[i]) {
+        continue;
+      }
+      for (const Transfer& transfer : render_target_transfers[i]) {
+        uint64_t pair_key =
+            (uint64_t(transfer.source->key().key) << 32) | render_targets[i]->key().key;
+        PairStats& stats = pair_stats[pair_key];
+        ++stats.count;
+        if (REXCVAR_GET(vulkan_rt_transfer_diagnostics)) {
+          auto cleared_it = g_rt_cleared_since_draw.find(static_cast<const void*>(transfer.source));
+          if (cleared_it != g_rt_cleared_since_draw.end() && cleared_it->second) {
+            ++g_transfers_from_cleared;
+          }
+          const void* src = static_cast<const void*>(transfer.source);
+          auto acquired_it = g_rt_acquired_serial.find(src);
+          if (acquired_it != g_rt_acquired_serial.end()) {
+            auto written_it = g_rt_written_serial.find(src);
+            const uint64_t written =
+                written_it != g_rt_written_serial.end() ? written_it->second : 0;
+            if (written < acquired_it->second) {
+              ++g_transfers_from_unwritten;
+            }
+          }
+        }
+        stats.tiles += transfer.end_tiles - transfer.start_tiles;
+        if (transfer.host_depth_source) {
+          ++stats.host_depth;
+        }
+      }
+    }
+    const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+    if (!window_start_ms) {
+      window_start_ms = now_ms;
+    }
+    if (now_ms - window_start_ms >= 5000) {
+      std::vector<std::pair<uint64_t, PairStats>> sorted(pair_stats.begin(), pair_stats.end());
+      std::sort(sorted.begin(), sorted.end(),
+                [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+      auto describe = [](uint32_t key_value) {
+        RenderTargetKey key;
+        key.key = key_value;
+        return fmt::format("{}{}x{}@{}+p{}", key.is_depth ? "D" : "C",
+                           uint32_t(key.resource_format), 1u << uint32_t(key.msaa_samples),
+                           uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp));
+      };
+      std::string top;
+      uint64_t total = 0;
+      for (const auto& entry : sorted) {
+        total += entry.second.count;
+      }
+      for (size_t k = 0; k < sorted.size() && k < 10; ++k) {
+        top += fmt::format(" {}->{} n={} tiles={}{}", describe(uint32_t(sorted[k].first >> 32)),
+                           describe(uint32_t(sorted[k].first)), sorted[k].second.count,
+                           sorted[k].second.tiles / std::max<uint64_t>(1, sorted[k].second.count),
+                           sorted[k].second.host_depth ? " hostdepth" : "");
+      }
+      REXGPU_INFO("RT transfers in {} ms: {} transfers ({} from a resolve-cleared source, {} from "
+                  "a source that wrote nothing since taking over), {} resolve clears, {} pairs |{}",
+                  uint32_t(now_ms - window_start_ms), total, g_transfers_from_cleared,
+                  g_transfers_from_unwritten, resolve_clears, sorted.size(), top);
+      g_transfers_from_cleared = 0;
+      g_transfers_from_unwritten = 0;
+      pair_stats.clear();
+      resolve_clears = 0;
+      window_start_ms = now_ms;
+    }
+  }
+#endif
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
@@ -5328,6 +5471,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             stencil_clear_rectangle_count += transfer.GetRectangles(
                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                 nullptr, resolve_clear_rectangle);
+            if (!REXCVAR_GET(vulkan_transfer_stencil_bits)) {
+              // Keep the stencil clear, skip the 8 per-bit draws.
+              continue;
+            }
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_vulkan_rt) {
@@ -6921,6 +7068,11 @@ void VulkanRenderTargetCache::DeferResolveClear(VulkanRenderTarget& render_targe
                                                 const Transfer::Rectangle& clear_rectangle,
                                                 uint64_t clear_value) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+#if REX_PLATFORM_SWITCH2
+  if (REXCVAR_GET(vulkan_rt_transfer_diagnostics)) {
+    g_rt_cleared_since_draw[&render_target] = true;
+  }
+#endif
   RenderTargetKey rt_key = render_target.key();
   VulkanRenderTarget::DeferredClear deferred_clear;
   deferred_clear.rectangle = clear_rectangle;

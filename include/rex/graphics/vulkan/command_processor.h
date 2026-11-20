@@ -11,11 +11,13 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -598,6 +600,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  // Asynchronous submission (vulkan_async_submit): EndSubmission hands the recorded stream to the
+  // device's ordered submission thread, which replays it into a VkCommandBuffer and submits it.
+  std::vector<std::shared_ptr<DeferredCommandBuffer>> deferred_command_buffers_spare_;
+  std::mutex deferred_command_buffers_spare_mutex_;
+  // Index of the last submission that actually reached the queue (fences of later submissions
+  // must not be queried yet).
+  std::atomic<uint64_t> submission_reached_queue_{0};
+  std::atomic<bool> async_submit_failed_{false};
+  // Sampled host GPU frame spans (vulkan_gpu_frame_span_sample_interval), for the stats line.
+  uint64_t gpu_frame_span_sum_us_ = 0;
+  uint64_t gpu_frame_span_max_us_ = 0;
+  uint32_t gpu_frame_span_count_ = 0;
+  uint64_t gpu_frame_draw_sum_us_ = 0;
+  uint64_t gpu_frame_resolve_sum_us_ = 0;
+  uint64_t gpu_frame_dump_sum_us_ = 0;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

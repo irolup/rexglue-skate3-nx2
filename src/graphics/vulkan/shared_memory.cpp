@@ -378,6 +378,12 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      // Hash before copying: a CPU write racing with the copy then shows up as a mismatch (one
+      // extra upload) instead of being hidden.
+      StoreUploadedPageHashes(
+          upload_range_start,
+          memory().TranslatePhysical<const uint8_t*>(upload_range_start << page_size_log2()),
+          uint32_t(upload_buffer_size >> page_size_log2()));
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);

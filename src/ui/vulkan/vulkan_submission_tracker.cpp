@@ -77,6 +77,9 @@ uint64_t VulkanSubmissionTracker::UpdateAndGetCompletedSubmission() {
     while (!fences_pending_.empty()) {
       const std::pair<uint64_t, VkFence>& pending_pair = fences_pending_.front();
       assert_true(pending_pair.first > submission_completed_on_gpu_);
+      if (!OrderedSubmitted(pending_pair.first, false)) {
+        break;
+      }
       if (dfn.vkGetFenceStatus(device, pending_pair.second) != VK_SUCCESS) {
         break;
       }
@@ -110,6 +113,8 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
   // "Fence signal operations that are defined by vkQueueSubmit additionally
   // include in the first synchronization scope all commands that occur earlier
   // in submission order."
+  // Pending fences may be queried below (newest first): make sure all of them were submitted.
+  OrderedSubmitted(UINT64_MAX, true);
   size_t reclaim_end = fences_pending_.size();
   if (reclaim_end) {
     const VulkanDevice::Functions& dfn = vulkan_device_->functions();

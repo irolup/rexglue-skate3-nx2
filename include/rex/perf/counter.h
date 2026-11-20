@@ -11,6 +11,7 @@
 #pragma once
 
 #include <atomic>
+#include <rex/platform.h>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -416,8 +417,25 @@ const char* CounterName(CounterId id);
 // Set a counter to an absolute value
 void SetCounter(CounterId id, int64_t value);
 
+#if REX_PLATFORM_SWITCH2
+namespace detail {
+// On Switch 2 the counters are only read by the debug overlay, which is not used: keep each call
+// site to a predictable branch unless enabled (cvar perf_counters_enabled).
+extern std::atomic<bool> g_counters_enabled;
+// ShouldCollectDrawDiagnostics() result, refreshed once per frame (ResetFrameCounters).
+extern std::atomic<bool> g_draw_diagnostics_cached;
+void IncrementCounterSlow(CounterId id, int64_t delta);
+}  // namespace detail
+// Atomically add to a counter
+inline void IncrementCounter(CounterId id, int64_t delta = 1) {
+  if (detail::g_counters_enabled.load(std::memory_order_relaxed)) {
+    detail::IncrementCounterSlow(id, delta);
+  }
+}
+#else
 // Atomically add to a counter
 void IncrementCounter(CounterId id, int64_t delta = 1);
+#endif
 
 // Record one draw-like operation in a coarse render bucket for view comparisons.
 void RecordDrawBucket(DrawBucket bucket, int64_t vertices, int64_t primitives);
@@ -446,7 +464,13 @@ bool IsCaptureRecording();
 
 // True when always-on heavyweight draw diagnostics are enabled, or while an
 // explicit F8 capture is recording.
+#if REX_PLATFORM_SWITCH2
+inline bool ShouldCollectDrawDiagnostics() {
+  return detail::g_draw_diagnostics_cached.load(std::memory_order_relaxed);
+}
+#else
 bool ShouldCollectDrawDiagnostics();
+#endif
 
 // True when callsites should build and record per-draw fingerprints.
 bool ShouldCollectDrawFingerprints();

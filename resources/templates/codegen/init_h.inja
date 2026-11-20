@@ -111,7 +111,9 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+#if REX_ARENA_MEMORY
+#define REX_PHYS_HOST_OFFSET(addr) rex_s2_fold_delta((u32)(addr))
+#elif REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u
@@ -273,6 +275,8 @@ inline std::unordered_map<u32, jmp_buf>& get_jmp_buf_map() {
 // Trap Handling
 //=============================================================================
 
+void rex_ppc_trap_report(PPCContext& ctx, uint16_t trap_type);  // SDK function_dispatcher.cpp
+
 inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
   switch (trap_type) {
     case 20:
@@ -283,7 +287,7 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
     }
     case 0:
     case 22:
-      REXCPU_WARN("tw/td trap hit (type {})", trap_type);
+      rex_ppc_trap_report(ctx, trap_type);
       break;
     case 25:
       break;

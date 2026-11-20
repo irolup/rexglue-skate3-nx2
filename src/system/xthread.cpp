@@ -173,10 +173,22 @@ void XThread::set_name(const std::string_view name) {
   }
 }
 
+REXCVAR_DEFINE_BOOL(inherit_creator_processor, true, "Kernel",
+                    "New guest threads without an explicit processor stay on their creator's "
+                    "hardware thread (Xbox 360 behavior)");
+
 static uint8_t next_cpu = 0;
 static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
   // NOTE: proc_mask is logical processors, not physical processors or cores.
   if (!proc_mask) {
+    // Xbox 360: a thread without an explicit XSetThreadProcessor stays on its creator's hardware
+    // thread, so it only runs when the (equal-priority) creator is descheduled. Games depend on
+    // that ordering (a helper started before its creator finished initialising shared state).
+    if (REXCVAR_GET(inherit_creator_processor)) {
+      if (auto* creator = XThread::GetCurrentThread()) {
+        return creator->active_cpu();
+      }
+    }
     next_cpu = (next_cpu + 1) % 6;
     return next_cpu;  // is this reasonable?
     // TODO(Triang3l): Does the following apply here?
@@ -461,7 +473,13 @@ X_STATUS XThread::Create() {
   }
 
   if (creation_params_.creation_flags & 0x60) {
+#if REX_PLATFORM_SWITCH2
+    thread_->set_priority(creation_params_.creation_flags & 0x20
+                              ? rex::thread::ThreadPriority::kAboveNormal
+                              : rex::thread::ThreadPriority::kNormal);
+#else
     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
+#endif
   }
 
   // Assign the newly created thread to the logical processor, and also set up

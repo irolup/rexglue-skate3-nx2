@@ -28,7 +28,10 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
+#if defined(__SWITCH__) || defined(__SWITCH2__)
+#define REX_PLATFORM_SWITCH2 1
+#define REX_PLATFORM_LINUX 1  // POSIX-like: Horizon via libounce/newlib
+#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
 #define REX_PLATFORM_MAC 1
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
@@ -44,6 +47,9 @@
 
 // Ensure all platform macros are always defined (0 when inactive)
 // so they can be used in static_assert and regular expressions.
+#ifndef REX_PLATFORM_SWITCH2
+#define REX_PLATFORM_SWITCH2 0
+#endif
 #ifndef REX_PLATFORM_MAC
 #define REX_PLATFORM_MAC 0
 #endif
@@ -156,3 +162,67 @@ const char kPathSeparator = '/';
 const char kGuestPathSeparator = '\\';
 
 }  // namespace rex
+
+#if REX_PLATFORM_SWITCH2 || defined(REX_SIM_ARENA)
+#define REX_ARENA_MEMORY 1
+#else
+#define REX_ARENA_MEMORY 0
+#endif
+
+#if REX_ARENA_MEMORY
+//=============================================================================
+// Switch 2 guest memory layout (also used on PC with REX_SIM_ARENA for testing).
+// Horizon cannot alias one backing object at several addresses, so the guest
+// 4 GB view is one flat arena and the alias ranges are folded onto it:
+//   arena + [0x00000000, 0x7F000000)  guest virtual (identity)
+//   arena + [0x80000000, 0x90000000)  xex (0x90000000-0x9FFFFFFF folds here)
+//   arena + 0x90000000 + [0, 0x20001000) physical (0x7F000000 view, 0xA0000000
+//                                         .. 0xFFFFFFFF all fold here)
+//=============================================================================
+#define REX_S2_PHYS_BASE 0x90000000ull
+#define REX_S2_ARENA_SIZE (0x90000000ull + 0x20001000ull)
+
+// Out-of-line slow path for the alias ranges (physical views, 0x7F000000, 0x90000000+).
+__attribute__((noinline)) inline int64_t rex_s2_fold_delta_slow(uint32_t a) {
+  int64_t f;
+  if (a < 0x7F000000u) {
+    f = a;
+  } else if (a < 0x80000000u) {
+    f = REX_S2_PHYS_BASE + (a - 0x7F000000u);
+  } else if (a < 0x90000000u) {
+    f = a;
+  } else if (a < 0xA0000000u) {
+    f = int64_t(a) - 0x10000000;
+  } else if (a < 0xE0000000u) {
+    f = REX_S2_PHYS_BASE + (a & 0x1FFFFFFFu);
+  } else {
+    f = REX_S2_PHYS_BASE + 0x1000 + (a - 0xE0000000u);
+  }
+  return f - int64_t(a);
+}
+
+// Called for guest memory accesses from generated code. Nearly all of them target guest virtual
+// memory (< 0x7F000000) or the xex image (0x80000000-0x8FFFFFFF), whose delta is 0: keep that
+// path inline (GCC would not inline the full chain into the huge generated functions).
+__attribute__((always_inline)) inline int64_t rex_s2_fold_delta(uint32_t a) {
+  if (__builtin_expect(a < 0x7F000000u || (a - 0x80000000u) < 0x10000000u, 1)) {
+    return 0;
+  }
+  return rex_s2_fold_delta_slow(a);
+}
+#endif
+
+#if REX_PLATFORM_SWITCH2
+#include <cstdio>
+// Unbuffered step trace for on-device bring-up (survives hard crashes).
+inline void rex_s2_trace(const char* msg) {
+  if (FILE* f = std::fopen("sdmc:/switch/skate3/trace.txt", "a")) {
+    std::fprintf(f, "%s\n", msg);
+    std::fflush(f);
+    std::fclose(f);
+  }
+}
+#define REX_S2_TRACE(m) rex_s2_trace(m)
+#else
+#define REX_S2_TRACE(m) ((void)0)
+#endif

@@ -111,7 +111,31 @@ class VulkanSubmissionTracker {
 
   [[nodiscard]] FenceAcquisition AcquireFenceToAdvanceSubmission();
 
+  // The signal of the current submission (whose FenceAcquisition is still alive) was queued with
+  // VulkanDevice::SubmitOrdered: its fence must not be queried before that ticket completes.
+  void SetOrderedTicketForCurrentSubmission(uint64_t ticket) {
+    if (ticket) {
+      ordered_tickets_.emplace_back(submission_current_, ticket);
+    }
+  }
+
  private:
+  // Whether every ordered submission up to submission_index has reached the queue (optionally
+  // waiting for that).
+  bool OrderedSubmitted(uint64_t submission_index, bool wait) {
+    while (!ordered_tickets_.empty() && ordered_tickets_.front().first <= submission_index) {
+      if (!vulkan_device_->IsOrderedTicketComplete(ordered_tickets_.front().second)) {
+        if (!wait) {
+          return false;
+        }
+        vulkan_device_->DrainOrderedSubmission();
+      }
+      ordered_tickets_.pop_front();
+    }
+    return true;
+  }
+  std::deque<std::pair<uint64_t, uint64_t>> ordered_tickets_;
+
   const VulkanDevice* vulkan_device_;
   uint64_t submission_current_ = 1;
   // Last submission with a successful fence signal as well as a successful

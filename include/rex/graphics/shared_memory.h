@@ -100,6 +100,22 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Software write tracking (gpu_revalidate_guest_memory): re-hashes the pages of a range the GPU
+  // holds as valid and invalidates (firing the watches of) those the CPU has changed. Needed by
+  // users that keep data cached without calling RequestRange each time (the texture cache).
+  bool revalidate_enabled() const { return revalidate_enabled_; }
+  // force: ignore the per-page back-off (data known to change often). Returns the changed pages.
+  uint32_t RevalidateRange(uint32_t start, uint32_t length, bool force = false);
+  // Pages found changed by the revalidation since the last call (diagnostics).
+  uint32_t TakeRevalidatedPageCount() { return revalidated_pages_.exchange(0); }
+  // Microseconds spent hashing pages (revalidation + upload hashes) since the last call.
+  uint64_t TakeRevalidateMicros() { return revalidate_us_.exchange(0); }
+  // Bytes hashed per path since the last call: 0 sample-only checks, 1 full re-checks, 2 full
+  // re-checks forced by recent texture changes, 3 hashes of uploaded pages, 4 of GPU-written pages.
+  void TakeHashBytes(uint64_t out[5]) {
+    for (int i = 0; i < 5; ++i) out[i] = hash_bytes_[i].exchange(0, std::memory_order_relaxed);
+  }
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
@@ -134,6 +150,10 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
+  // Software write tracking: called by UploadRanges implementations right before copying the
+  // pages, so a CPU write racing with the upload can't be hidden by hashing afterwards.
+  void StoreUploadedPageHashes(uint32_t page_first, const uint8_t* data, uint32_t page_count);
+
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
   // called for each successfully uploaded range as early as possible, before
@@ -166,6 +186,25 @@ class SharedMemory {
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
   uint32_t page_size_log2_;
+
+  // Software replacement for write-fault tracking (platforms with no usable memory protection,
+  // such as the Switch 2): pages the GPU believes are valid are re-hashed against the guest
+  // memory when requested, and invalidated through the normal path if they changed. Pages that
+  // keep matching are checked less and less often.
+  uint32_t RevalidateGuestPages(uint32_t page_first, uint32_t page_last, bool force = false);
+  void StorePageHashes(const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges);
+  bool revalidate_enabled_ = false;
+  std::atomic<uint32_t> revalidated_pages_{0};
+  std::atomic<uint64_t> revalidate_us_{0};
+  std::atomic<uint64_t> hash_bytes_[5] = {};
+  std::vector<uint64_t> page_hash_;
+  std::vector<uint32_t> page_check_ms_;
+  std::vector<uint8_t> page_stable_;
+  // Cheap fingerprint (8 slices of the page) used for long-stable pages, and how many sample-only
+  // checks passed since the last full hash (a full hash is forced every kFullHashEvery-th check).
+  std::vector<uint64_t> page_sample_;
+  std::vector<uint8_t> page_sample_streak_;
+  uint64_t SamplePageHash(const uint8_t* page_data) const;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;

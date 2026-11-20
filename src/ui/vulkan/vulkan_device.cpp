@@ -10,7 +10,10 @@
  */
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -19,7 +22,11 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/thread.h>
 #include <rex/ui/vulkan/device.h>
+#if REX_PLATFORM_SWITCH2
+#include <switch.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -873,7 +880,156 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   return device;
 }
 
+struct VulkanDevice::OrderedSubmissionState {
+  std::mutex mutex;
+  std::condition_variable work_cv;
+  std::condition_variable idle_cv;
+  std::deque<std::function<void()>> closures;
+  bool busy = false;
+  bool quit = false;
+  uint64_t enqueued = 0;
+  std::atomic<uint64_t> completed{0};
+  std::atomic<bool> started{false};
+  std::thread::id thread_id;
+  std::unique_ptr<rex::thread::Thread> thread;
+};
+
+void VulkanDevice::EnableOrderedSubmission() const {
+  if (ordered_submission_enabled_.load(std::memory_order_acquire)) {
+    return;
+  }
+  ordered_submission_ = std::make_unique<OrderedSubmissionState>();
+  OrderedSubmissionState* state = ordered_submission_.get();
+  int ideal_core = -1;
+#if REX_PLATFORM_SWITCH2
+  // Prefer a core other than the caller's (the GPU command processor), but allow migration.
+  ideal_core = int((svcGetCurrentProcessorNumber() + 1) % 6);
+#endif
+  rex::thread::Thread::CreationParameters params;
+  params.stack_size = 256 * 1024;
+  state->thread = rex::thread::Thread::Create(params, [state, ideal_core]() {
+#if REX_PLATFORM_SWITCH2
+    if (ideal_core >= 0) {
+      svcSetThreadCoreMask(CUR_THREAD_HANDLE, ideal_core, 0x3F);
+    }
+#endif
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->thread_id = std::this_thread::get_id();
+    }
+    state->started.store(true, std::memory_order_release);
+    state->idle_cv.notify_all();
+    std::unique_lock<std::mutex> lock(state->mutex);
+    for (;;) {
+      state->work_cv.wait(lock, [state] { return state->quit || !state->closures.empty(); });
+      if (state->closures.empty()) {
+        break;
+      }
+      std::function<void()> closure = std::move(state->closures.front());
+      state->closures.pop_front();
+      state->busy = true;
+      lock.unlock();
+      closure();
+      closure = nullptr;
+      lock.lock();
+      state->busy = false;
+      state->completed.fetch_add(1, std::memory_order_release);
+      state->idle_cv.notify_all();
+    }
+  });
+  if (!state->thread) {
+    REXLOG_ERROR("Vulkan: failed to create the ordered submission thread, submitting inline");
+    ordered_submission_.reset();
+    return;
+  }
+  state->thread->set_name("GPU Submit");
+  {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->idle_cv.wait(lock, [state] { return state->started.load(std::memory_order_acquire); });
+  }
+  ordered_submission_enabled_.store(true, std::memory_order_release);
+  REXLOG_INFO("Vulkan: ordered asynchronous queue submission enabled (ideal core {})", ideal_core);
+}
+
+bool VulkanDevice::IsOrderedSubmissionThread() const {
+  if (!ordered_submission_enabled_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  OrderedSubmissionState* state = ordered_submission_.get();
+  return state && state->thread_id == std::this_thread::get_id();
+}
+
+uint64_t VulkanDevice::SubmitOrdered(std::function<void()> closure) const {
+  const bool enabled = ordered_submission_enabled_.load(std::memory_order_acquire);
+  OrderedSubmissionState* state = enabled ? ordered_submission_.get() : nullptr;
+  if (!enabled || !state ||
+      IsOrderedSubmissionThread()) {
+    closure();
+    return 0;
+  }
+  uint64_t ticket;
+  {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    // Bound how far the producer can run ahead of the queue.
+    constexpr size_t kMaxQueuedClosures = 3;
+    state->idle_cv.wait(lock, [state] { return state->closures.size() < kMaxQueuedClosures; });
+    state->closures.push_back(std::move(closure));
+    ticket = ++state->enqueued;
+  }
+  state->work_cv.notify_one();
+  return ticket;
+}
+
+bool VulkanDevice::IsOrderedTicketComplete(uint64_t ticket) const {
+  OrderedSubmissionState* state =
+      ordered_submission_enabled_.load(std::memory_order_acquire) ? ordered_submission_.get()
+                                                                  : nullptr;
+  return !ticket || !state || state->completed.load(std::memory_order_acquire) >= ticket;
+}
+
+void VulkanDevice::DrainOrderedSubmission() const {
+  const bool enabled = ordered_submission_enabled_.load(std::memory_order_acquire);
+  OrderedSubmissionState* state = enabled ? ordered_submission_.get() : nullptr;
+  if (!enabled || !state ||
+      IsOrderedSubmissionThread()) {
+    return;
+  }
+  // Wait only for what is queued now: a busy producer must not starve the caller.
+  std::unique_lock<std::mutex> lock(state->mutex);
+  const uint64_t target = state->enqueued;
+  state->idle_cv.wait(lock, [state, target] {
+    return state->completed.load(std::memory_order_acquire) >= target;
+  });
+}
+
+void VulkanDevice::WaitOrderedSubmissionForAcquire() const {
+  // A thread already holding a queue must not wait (the worker may need that queue).
+  if (Queue::acquisition_depth > 0) {
+    return;
+  }
+  DrainOrderedSubmission();
+}
+
+void VulkanDevice::ShutdownOrderedSubmission() {
+  OrderedSubmissionState* state = ordered_submission_.get();
+  if (!state) {
+    return;
+  }
+  DrainOrderedSubmission();
+  ordered_submission_enabled_.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->quit = true;
+  }
+  state->work_cv.notify_all();
+  if (state->thread) {
+    rex::thread::Wait(state->thread.get(), false);
+  }
+  ordered_submission_.reset();
+}
+
 VulkanDevice::~VulkanDevice() {
+  ShutdownOrderedSubmission();
   if (device_) {
     vulkan_instance_->functions().vkDestroyDevice(device_, nullptr);
   }

@@ -43,6 +43,10 @@ class AudioSystem : public system::IAudioSystem {
 
   virtual X_STATUS Setup(system::KernelState* kernel_state);
   virtual void Shutdown();
+  // Called by a host audio driver whose output has been silent since a client registered: if the
+  // worker thread never started or has exited, create it again (logged). A worker that exists but
+  // is stuck is only reported, never duplicated.
+  void EnsureWorkerAlive(const char* reason);
 
   X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index);
   void UnregisterClient(size_t index);
@@ -75,6 +79,11 @@ class AudioSystem : public system::IAudioSystem {
 
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
+  // Set while WorkerThreadMain runs; heartbeat increments every loop iteration.
+  std::atomic<bool> worker_alive_ = {false};
+  std::atomic<uint64_t> worker_heartbeat_ = {0};
+  system::KernelState* worker_kernel_state_ = nullptr;
+  void CreateWorkerThread();
 
   rex::thread::global_critical_region global_critical_region_;
   static const size_t kMaximumClientCount = 8;

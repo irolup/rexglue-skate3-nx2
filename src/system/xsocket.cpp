@@ -29,7 +29,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_SWITCH2
 #ifdef IPPROTO_TCP
 #undef IPPROTO_TCP
 #endif

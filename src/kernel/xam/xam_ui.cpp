@@ -423,6 +423,18 @@ class KeyboardInputDialog : public XamDialog {
   bool cancelled_ = true;
 };
 
+#if REX_PLATFORM_SWITCH2
+}  // namespace xam
+}  // namespace kernel
+namespace ui {
+// platform/ui_switch2.cpp: system keyboard applet. 1 = entered, 0 = cancelled, -1 = unavailable.
+int ShowSystemKeyboard(const std::string& header, const std::string& sub,
+                       const std::string& initial, uint32_t max_chars, std::string& out_text);
+}  // namespace ui
+namespace kernel {
+namespace xam {
+#endif
+
 // https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/
 u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_text,
                             mapped_wstring title, mapped_wstring description, mapped_wstring buffer,
@@ -438,6 +450,41 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   assert_true(overlapped.guest_address() != 0);
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
+
+#if REX_PLATFORM_SWITCH2
+  // No keyboard on the console: use the system software keyboard applet instead of the ImGui
+  // text box. It blocks, so it runs on the deferred-completion thread, not the UI thread.
+  if (!REXCVAR_GET(headless)) {
+    auto load_utf8 = [](const mapped_wstring& s) -> std::string {
+      return s ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                     REX_KERNEL_MEMORY()->TranslateVirtual(s.guest_address())))
+               : std::string();
+    };
+    std::string title_str = load_utf8(title);
+    std::string desc_str = load_utf8(description);
+    std::string def_text_str = load_utf8(default_text);
+    auto run = [buffer, buffer_length, buffer_size, title_str, desc_str, def_text_str](
+                   uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+      std::string text;
+      const int r = rex::ui::ShowSystemKeyboard(title_str, desc_str, def_text_str,
+                                                buffer_length ? buffer_length - 1 : 0, text);
+      length = 0;
+      if (r == 0) {
+        extended_error = X_ERROR_CANCELLED;
+        return X_ERROR_SUCCESS;
+      }
+      if (r < 0) {
+        text = def_text_str;
+      }
+      std::memset(buffer, 0, buffer_size);
+      rex::string::util_copy_and_swap_truncating(buffer, rex::string::to_utf16(text),
+                                                 buffer_length);
+      extended_error = X_ERROR_SUCCESS;
+      return X_ERROR_SUCCESS;
+    };
+    return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
+  }
+#endif
 
   X_RESULT result;
   if (REXCVAR_GET(headless)) {

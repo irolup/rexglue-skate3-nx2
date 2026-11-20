@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstring>
 #include <string_view>
+#include <thread>
+#include <chrono>
 
 #include <fmt/format.h>
 
@@ -38,6 +40,17 @@
 
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(gpu_fast_register_writes, true, "GPU",
+                    "Store GPU registers without side effects directly instead of going through "
+                    "the virtual WriteRegister chain (Switch 2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(swap_frame_limit_fps, REX_PLATFORM_SWITCH2 ? 60.0 : 0.0, "GPU",
+                      "Cap guest swaps per second in the command processor (0 = off). Unlike "
+                      "60 Hz vblanks (vsync), a frame that misses the deadline is not delayed "
+                      "to the next vblank.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -49,7 +62,7 @@ REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
+REXCVAR_DEFINE_STRING(readback_resolve, REX_PLATFORM_SWITCH2 ? "auto" : "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
                       " fast: Read previous frame (delayed, copy every frame)\n"
@@ -132,6 +145,50 @@ REXCVAR_DEFINE_BOOL(gpu_cpu_profile, false, "GPU",
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
+
+// Diagnostics for the Switch 2 "GPU stats" line (command processor thread only, read there too).
+namespace {
+uint64_t g_wait_reg_mem_us = 0;
+uint64_t g_frame_limit_sleep_us = 0;
+uint32_t g_wait_reg_mem_top_addr = 0;
+uint64_t g_wait_reg_mem_top_us = 0;
+bool g_wait_reg_mem_top_is_memory = false;
+// Per-frame statistics (swap to swap on this thread) for the 5 s stats window.
+uint64_t g_frame_draws = 0;            // draws in the current frame
+uint64_t g_frame_wait_us = 0;          // WAIT_REG_MEM time in the current frame
+uint32_t g_frames_over_17ms = 0;
+uint32_t g_frames_over_25ms = 0;
+uint32_t g_frame_max_us = 0;
+uint32_t g_frame_max_wait_us = 0;      // WAIT_REG_MEM time inside the slowest frame
+uint32_t g_frame_max_draws = 0;        // draws in the slowest frame
+uint64_t g_frame_draws_total = 0;
+uint32_t g_frame_count = 0;
+}  // namespace
+
+void TakeCommandProcessorFrameStats(uint32_t& over_17ms, uint32_t& over_25ms, uint32_t& max_us,
+                                    uint32_t& max_wait_us, uint32_t& max_draws,
+                                    uint32_t& avg_draws) {
+  over_17ms = g_frames_over_17ms;
+  over_25ms = g_frames_over_25ms;
+  max_us = g_frame_max_us;
+  max_wait_us = g_frame_max_wait_us;
+  max_draws = g_frame_max_draws;
+  avg_draws = g_frame_count ? uint32_t(g_frame_draws_total / g_frame_count) : 0;
+  g_frames_over_17ms = g_frames_over_25ms = g_frame_max_us = g_frame_max_wait_us = 0;
+  g_frame_max_draws = 0;
+  g_frame_draws_total = 0;
+  g_frame_count = 0;
+}
+
+void TakeCommandProcessorWaitStats(uint64_t& wait_reg_mem_us, uint64_t& frame_limit_sleep_us,
+                                   uint32_t& top_addr, bool& top_is_memory) {
+  wait_reg_mem_us = g_wait_reg_mem_us;
+  frame_limit_sleep_us = g_frame_limit_sleep_us;
+  top_addr = g_wait_reg_mem_top_addr;
+  top_is_memory = g_wait_reg_mem_top_is_memory;
+  g_wait_reg_mem_us = g_frame_limit_sleep_us = g_wait_reg_mem_top_us = 0;
+  g_wait_reg_mem_top_addr = 0;
+}
 
 namespace {
 
@@ -297,9 +354,19 @@ void CommandProcessor::InvalidateGpuMemory() {}
 
 ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
     bool legacy_readback_resolve_enabled) const {
+#if REX_PLATFORM_SWITCH2
+  // Called for every resolve; the name lookup and string parse cost ~1% of the GPU thread.
+  // options.txt is applied once at startup, so evaluate once.
+  static const ReadbackResolveMode shared_mode =
+      ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
+  static const bool shared_mode_overrides_legacy =
+      shared_mode != ReadbackResolveMode::kDisabled ||
+      rex::cvar::HasNonDefaultValue("readback_resolve");
+#else
   ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
   bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
                                       rex::cvar::HasNonDefaultValue("readback_resolve");
+#endif
   if (shared_mode_overrides_legacy) {
     return shared_mode;
   }
@@ -308,10 +375,20 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
+#if REX_PLATFORM_SWITCH2
+  // Called for every draw: avoid the cvar name lookup each time (settings are fixed at startup).
+  static const bool legacy_overridden =
+      legacy_readback_memexport_cvar_name_ &&
+      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_);
+  if (legacy_overridden) {
+    return legacy_backend_flag;
+  }
+#else
   if (legacy_readback_memexport_cvar_name_ &&
       rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
     return legacy_backend_flag;
   }
+#endif
   return REXCVAR_GET(readback_memexport);
 }
 
@@ -466,6 +543,50 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+#if REX_PLATFORM_SWITCH2
+namespace {
+struct KnownGpuRegisterBits {
+  uint64_t bits[(RegisterFile::kRegisterCount + 63) / 64] = {};
+  KnownGpuRegisterBits() {
+#define XE_GPU_REGISTER(index, type, name) \
+  if (size_t(index) < RegisterFile::kRegisterCount) bits[(index) >> 6] |= UINT64_C(1) << ((index) & 63);
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  }
+  uint64_t operator[](size_t i) const { return bits[i]; }
+};
+const KnownGpuRegisterBits kKnownGpuRegisterBits;
+
+// Registers whose writes have side effects (in this class or in a backend's WriteRegister
+// override): everything else can be stored directly, skipping the virtual WriteRegister chain
+// (type-0 packets write registers one by one; ~6% of the GPU thread).
+struct SpecialGpuRegisterBits {
+  uint64_t bits[(RegisterFile::kRegisterCount + 63) / 64] = {};
+  void Set(uint32_t index) { bits[index >> 6] |= UINT64_C(1) << (index & 63); }
+  void SetRange(uint32_t first, uint32_t last) {
+    for (uint32_t i = first; i <= last; ++i) Set(i);
+  }
+  SpecialGpuRegisterBits() {
+    SetRange(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7);
+    Set(XE_GPU_REG_COHER_STATUS_HOST);
+    Set(XE_GPU_REG_DC_LUT_RW_INDEX);
+    Set(XE_GPU_REG_DC_LUT_SEQ_COLOR);
+    Set(XE_GPU_REG_DC_LUT_PWL_DATA);
+    Set(XE_GPU_REG_DC_LUT_30_COLOR);
+    // Tracked by the Vulkan command processor (constant buffers, fetch constants).
+    SetRange(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_511_W);
+    SetRange(XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+    SetRange(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5);
+  }
+  bool IsPlain(uint32_t index) const {
+    return index < RegisterFile::kRegisterCount &&
+           !(bits[index >> 6] & (UINT64_C(1) << (index & 63)));
+  }
+};
+const SpecialGpuRegisterBits kSpecialGpuRegisterBits;
+}  // namespace
+#endif
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -481,7 +602,13 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+#if REX_PLATFORM_SWITCH2
+  // GetRegisterInfo is a large switch with a static-init guard per case; it ran on every register
+  // write (~2-3% of the GPU thread in gameplay) only to log unknown registers. Use a bitmap.
+  if (!(kKnownGpuRegisterBits[index >> 6] & (UINT64_C(1) << (index & 63)))) {
+#else
   if (!regs.GetRegisterInfo(index)) {
+#endif
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -619,8 +746,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+#if REX_PLATFORM_SWITCH2
+  const bool fast_register_writes = REXCVAR_GET(gpu_fast_register_writes);
+#endif
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
+#if REX_PLATFORM_SWITCH2
+    if (fast_register_writes && kSpecialGpuRegisterBits.IsPlain(start_index + i)) {
+      const_cast<volatile uint32_t&>(register_file_->values[start_index + i]) = data;
+      continue;
+    }
+#endif
     WriteRegister(start_index + i, data);
   }
 }
@@ -861,9 +997,19 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+#if REX_PLATFORM_SWITCH2
+  const bool fast_register_writes = REXCVAR_GET(gpu_fast_register_writes);
+#endif
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+#if REX_PLATFORM_SWITCH2
+    if (fast_register_writes && kSpecialGpuRegisterBits.IsPlain(target_index)) {
+      // Volatile for the WAIT_REG_MEM loop, as in WriteRegister.
+      const_cast<volatile uint32_t&>(register_file_->values[target_index]) = reg_data;
+      continue;
+    }
+#endif
     WriteRegister(target_index, reg_data);
   }
 
@@ -1157,6 +1303,54 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
 
+  // Per-frame statistics: swap-to-swap time on this thread (includes the previous limiter sleep).
+  {
+    static std::chrono::steady_clock::time_point last_swap{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last_swap.time_since_epoch().count() != 0) {
+      const uint32_t frame_us = uint32_t(
+          std::chrono::duration_cast<std::chrono::microseconds>(now - last_swap).count());
+      const uint32_t frame_wait_us = uint32_t(g_frame_wait_us);
+      if (frame_us > 20000) ++g_frames_over_17ms;  // clearly missed its 16.7 ms slot
+      if (frame_us > 25000) ++g_frames_over_25ms;
+      if (frame_us > g_frame_max_us) {
+        g_frame_max_us = frame_us;
+        g_frame_max_wait_us = frame_wait_us;
+        g_frame_max_draws = uint32_t(g_frame_draws);
+      }
+      g_frame_draws_total += g_frame_draws;
+      ++g_frame_count;
+    }
+    last_swap = now;
+    g_frame_draws = 0;
+    g_frame_wait_us = 0;
+  }
+
+  // Swap pacing: the frame has been submitted, now wait for its slot if it came early.
+  {
+    const double limit_fps = REXCVAR_GET(swap_frame_limit_fps);
+    static std::chrono::steady_clock::time_point next_swap{};
+    const auto now = std::chrono::steady_clock::now();
+    if (limit_fps > 0.0) {
+      const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(1.0 / limit_fps));
+      if (next_swap.time_since_epoch().count() == 0 || now >= next_swap + period) {
+        // First frame, or more than a frame late: restart the schedule from now.
+        next_swap = now + period;
+      } else {
+        if (now < next_swap) {
+          std::this_thread::sleep_until(next_swap);
+          g_frame_limit_sleep_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - now)
+                                                 .count());
+        }
+        next_swap += period;
+      }
+    } else {
+      next_swap = {};
+    }
+  }
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   CpuProfileOnFrameEnd();
 #endif
@@ -1276,6 +1470,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  std::chrono::steady_clock::time_point wait_start{};
+  bool waited = false;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1317,13 +1513,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (!waited) {
+        waited = true;
+        wait_start = std::chrono::steady_clock::now();
+      }
       // Wait. Attributed separately so time spent blocked on guest-side
       // progress isn't read as command processing cost.
       PROFILE_SCOPE_COUNTER(kCpuGuestWaitUs);
       if (wait >= 0x100) {
         PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
+        if (!REXCVAR_GET(vsync) || REX_PLATFORM_SWITCH2) {
+          // User wants it fast and dangerous. On Switch 2, vsync=true is used for 60 Hz guest
+          // vblanks, but millisecond sleeps here would stall the GPU command thread.
           rex::thread::MaybeYield();
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
@@ -1340,6 +1541,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (waited) {
+    const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - wait_start)
+                                     .count());
+    g_wait_reg_mem_us += us;
+    g_frame_wait_us += us;
+    if (us > g_wait_reg_mem_top_us) {
+      g_wait_reg_mem_top_us = us;
+      g_wait_reg_mem_top_addr = poll_reg_addr;
+      g_wait_reg_mem_top_is_memory = is_memory;
+    }
+  }
 
   return true;
 }
@@ -1580,6 +1793,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
 bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
                                               const char* opcode_name, uint32_t viz_query_condition,
                                               uint32_t count_remaining) {
+  ++g_frame_draws;
   // if viz_query_condition != 0, this is a conditional draw based on viz query.
   // This ID matches the one issued in PM4_VIZ_QUERY
   // uint32_t viz_id = viz_query_condition & 0x3F;

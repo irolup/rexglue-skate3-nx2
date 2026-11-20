@@ -27,6 +27,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/chrono/clock.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -61,6 +62,21 @@ REXCVAR_DEFINE_BOOL(vulkan_storage_image_texture_loads, false, "GPU/Vulkan",
                     "several times slower than device bandwidth on some hosts, but reported to "
                     "regress badly on others; off by default")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_storage_image_texture_loads_unscaled, false, "GPU/Vulkan",
+                    "Also use the storage-image destination load path for textures that are not "
+                    "resolution-scaled resolve targets (with scale 1 the shader addresses the "
+                    "shared memory buffer exactly like the regular load shader). Skips the copy "
+                    "buffer, a barrier and the buffer-to-image copy for 2D single-level 32bpp "
+                    "textures, e.g. render-to-texture images reloaded every frame")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+#if REX_PLATFORM_SWITCH2
+namespace rex::graphics {
+void Ns2RecordTextureLoad(uint32_t base, uint32_t size, uint32_t width, uint32_t height,
+                          uint32_t format, bool hash_changed_recently);
+}  // namespace rex::graphics
+#endif
 
 namespace rex::graphics::vulkan {
 
@@ -1767,6 +1783,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
   DebugLogTeamProfileBackgroundGpuEvent("load-enter", UINT32_MAX, texture);
+#if REX_PLATFORM_SWITCH2
+  {
+    const uint32_t now_ms = uint32_t(rex::chrono::Clock::QueryHostUptimeMillis());
+    const bool hash_changed =
+        texture.last_change_ms() && now_ms - texture.last_change_ms() < 100;
+    Ns2RecordTextureLoad(texture_key.base_page << 12,
+                         load_base ? vulkan_texture.GetGuestBaseSize()
+                                   : vulkan_texture.GetGuestMipsSize(),
+                         texture_key.GetWidth(), texture_key.GetHeight(),
+                         uint32_t(texture_key.format), hash_changed);
+  }
+#endif
 
   // Get the pipeline.
   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
@@ -1944,7 +1972,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // unpacked textures with 32-bit-class host formats only.
   VkPipeline pipeline_storage_dest = VK_NULL_HANDLE;
   VkDescriptorSet descriptor_set_dest_storage = VK_NULL_HANDLE;
-  if (texture_key.scaled_resolve && REXCVAR_GET(vulkan_storage_image_texture_loads)) {
+  if (texture_key.scaled_resolve ? REXCVAR_GET(vulkan_storage_image_texture_loads)
+                                 : REXCVAR_GET(vulkan_storage_image_texture_loads_unscaled)) {
     static int storage_dest_fallback_logs_remaining = 8;
     auto log_storage_fallback = [&](const char* reason) {
       if (storage_dest_fallback_logs_remaining > 0) {

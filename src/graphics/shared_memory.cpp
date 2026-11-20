@@ -10,8 +10,15 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
+
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
+#include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
@@ -30,7 +37,24 @@ SharedMemory::~SharedMemory() {
   ShutdownCommon();
 }
 
+REXCVAR_DEFINE_BOOL(gpu_revalidate_guest_memory, REX_ARENA_MEMORY, "GPU",
+                    "Re-hash guest memory pages the GPU considers valid to detect CPU writes "
+                    "(for platforms without page write-fault tracking)");
+
+REXCVAR_DEFINE_BOOL(gpu_revalidate_gpu_written, false, "GPU",
+                    "Also revalidate pages last written by the GPU (resolve targets) to catch the "
+                    "CPU reusing that memory. Expensive (hashes every resolve destination).");
+
 void SharedMemory::InitializeCommon() {
+  revalidate_enabled_ = REXCVAR_GET(gpu_revalidate_guest_memory);
+  if (revalidate_enabled_) {
+    const size_t pages = size_t(kBufferSize) >> page_size_log2_;
+    page_hash_.assign(pages, 0);
+    page_check_ms_.assign(pages, 0);
+    page_stable_.assign(pages, 0);
+    page_sample_.assign(pages, 0);
+    page_sample_streak_.assign(pages, 0);
+  }
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   valid_buffer_a_.assign(num_system_page_flags_, 0);
   valid_buffer_b_.assign(num_system_page_flags_, 0);
@@ -326,6 +350,12 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
   MakeRangeValid(start, length, true);
+  // Software write tracking of GPU-written pages (off by default: hashing every resolve target
+  // cost ~1 GB/s of hashing on the GPU thread). When on, the CPU-side content is remembered so
+  // CPU reuse of resolve memory can be detected.
+  if (revalidate_enabled_ && REXCVAR_GET(gpu_revalidate_gpu_written)) {
+    StorePageHashes({{page_first, page_last - page_first + 1}});
+  }
 }
 
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -402,6 +432,176 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+uint64_t SharedMemory::SamplePageHash(const uint8_t* page_data) const {
+  // 8 slices of 64 bytes spread over the page: catches any rewrite of a meaningful part of it
+  // (texture/vertex reloads, movie frames) at 1/8 of the cost of hashing the whole page.
+  constexpr size_t kSlices = 8, kSliceBytes = 64;
+  const size_t stride = (size_t(1) << page_size_log2_) / kSlices;
+  uint8_t gathered[kSlices * kSliceBytes];
+  for (size_t i = 0; i < kSlices; ++i) {
+    std::memcpy(gathered + i * kSliceBytes, page_data + i * stride, kSliceBytes);
+  }
+  return XXH3_64bits(gathered, sizeof(gathered));
+}
+
+void SharedMemory::StoreUploadedPageHashes(uint32_t page_first, const uint8_t* data,
+                                           uint32_t page_count) {
+  if (!revalidate_enabled_) {
+    return;
+  }
+  struct HashTimer {
+    std::atomic<uint64_t>& total;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~HashTimer() {
+      total.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()),
+                      std::memory_order_relaxed);
+    }
+  } hash_timer{revalidate_us_};
+  const uint32_t now = uint32_t(chrono::Clock::QueryHostUptimeMillis()) | 1u;
+  const size_t page_size = size_t(1) << page_size_log2_;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    const uint32_t page = page_first + i;
+    hash_bytes_[3].fetch_add(page_size, std::memory_order_relaxed);
+    page_hash_[page] = XXH3_64bits(data + i * page_size, page_size);
+    page_sample_[page] = SamplePageHash(data + i * page_size);
+    page_sample_streak_[page] = 0;
+    page_check_ms_[page] = now;
+    page_stable_[page] = 0;
+  }
+}
+
+void SharedMemory::StorePageHashes(
+    const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges) {
+  if (!revalidate_enabled_) {
+    return;
+  }
+  const uint8_t* base = memory_.TranslatePhysical<const uint8_t*>(0);
+  const uint32_t now = uint32_t(chrono::Clock::QueryHostUptimeMillis()) | 1u;
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  for (const auto& range : page_ranges) {
+    for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+      const uint8_t* page_data = base + (size_t(page) << page_size_log2_);
+      hash_bytes_[4].fetch_add(page_size, std::memory_order_relaxed);
+      page_hash_[page] = XXH3_64bits(page_data, page_size);
+      page_sample_[page] = SamplePageHash(page_data);
+      page_sample_streak_[page] = 0;
+      page_check_ms_[page] = now;
+      page_stable_[page] = 0;
+    }
+  }
+}
+
+uint32_t SharedMemory::RevalidateGuestPages(uint32_t page_first, uint32_t page_last,
+                                            bool force) {
+  if (!revalidate_enabled_) {
+    return 0;
+  }
+  uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
+  if (!valid_flags) {
+    return 0;
+  }
+  uint32_t changed_pages = 0;
+  const bool revalidate_gpu_written = REXCVAR_GET(gpu_revalidate_gpu_written);
+  // Times only calls that actually hash something (most calls skip every page).
+  struct HashTimer {
+    std::atomic<uint64_t>& total;
+    std::chrono::steady_clock::time_point start{};
+    bool started = false;
+    void Start() {
+      if (!started) {
+        started = true;
+        start = std::chrono::steady_clock::now();
+      }
+    }
+    ~HashTimer() {
+      if (!started) {
+        return;
+      }
+      total.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()),
+                      std::memory_order_relaxed);
+    }
+  } hash_timer{revalidate_us_};
+  const uint8_t* base = memory_.TranslatePhysical<const uint8_t*>(0);
+  const uint32_t now = uint32_t(chrono::Clock::QueryHostUptimeMillis()) | 1u;
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  uint32_t run_first = UINT32_MAX;
+  auto flush_run = [&](uint32_t run_last) {
+    if (run_first != UINT32_MAX) {
+      changed_pages += run_last - run_first + 1;
+      revalidated_pages_.fetch_add(run_last - run_first + 1, std::memory_order_relaxed);
+      MemoryInvalidationCallback(run_first << page_size_log2_,
+                                 (run_last - run_first + 1) << page_size_log2_, true);
+      run_first = UINT32_MAX;
+    }
+  };
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    const uint64_t bit = uint64_t(1) << (page & 63);
+    const bool valid = (valid_flags[page >> 6] & bit) != 0;
+    // GPU-written pages (resolves) intentionally differ from CPU memory: skipped unless
+    // gpu_revalidate_gpu_written (then their stored hash is the CPU-side content at resolve time).
+    const bool gpu_written = (system_page_flags_valid_and_gpu_written_[page >> 6] & bit) != 0;
+    if (!valid || !page_check_ms_[page] || (gpu_written && !revalidate_gpu_written)) {
+      flush_run(page - 1);
+      continue;
+    }
+    // Static data backs off to a check every ~0.5 s; data that keeps changing is checked at
+    // every request.
+    const uint32_t interval_ms =
+        force ? 0u : uint32_t(4) << std::min<uint32_t>(page_stable_[page], 7);
+    if (now - page_check_ms_[page] < interval_ms) {
+      flush_run(page - 1);
+      continue;
+    }
+    page_check_ms_[page] = now;
+    hash_timer.Start();
+    const uint8_t* page_data = base + (size_t(page) << page_size_log2_);
+    // Long-stable pages: compare the cheap sample first; a full hash only when it differs or
+    // every kFullHashEvery-th check (so a small edit of a static-looking page is still caught).
+    constexpr uint8_t kFullHashEvery = 8;
+    constexpr uint8_t kStableForSampling = 3;
+    if (!force && page_stable_[page] >= kStableForSampling &&
+        page_sample_streak_[page] + 1 < kFullHashEvery &&
+        (hash_bytes_[0].fetch_add(512, std::memory_order_relaxed), true) &&
+        SamplePageHash(page_data) == page_sample_[page]) {
+      ++page_sample_streak_[page];
+      if (page_stable_[page] < 255) {
+        ++page_stable_[page];
+      }
+      flush_run(page - 1);
+      continue;
+    }
+    page_sample_streak_[page] = 0;
+    hash_bytes_[force ? 2 : 1].fetch_add(page_size, std::memory_order_relaxed);
+    const uint64_t hash = XXH3_64bits(page_data, page_size);
+    if (hash == page_hash_[page]) {
+      if (page_stable_[page] < 255) {
+        ++page_stable_[page];
+      }
+      flush_run(page - 1);
+    } else {
+      page_stable_[page] = 0;
+      if (run_first == UINT32_MAX) {
+        run_first = page;
+      }
+    }
+  }
+  flush_run(page_last);
+  return changed_pages;
+}
+
+uint32_t SharedMemory::RevalidateRange(uint32_t start, uint32_t length, bool force) {
+  if (!revalidate_enabled_ || !length || start >= kBufferSize) {
+    return 0;
+  }
+  length = std::min(length, kBufferSize - start);
+  return RevalidateGuestPages(start >> page_size_log2_, (start + length - 1) >> page_size_log2_,
+                              force);
+}
+
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
   if (ranges == nullptr || !count) {
     return true;
@@ -454,6 +654,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
       return false;
+    }
+  }
+  if (revalidate_enabled_) {
+    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+      RevalidateGuestPages(range.first >> page_size_log2_,
+                           (range.first + range.second - 1) >> page_size_log2_);
     }
   }
 
@@ -573,6 +779,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  // Page hashes are stored by UploadRanges from the uploaded bytes (StoreUploadedPageHashes).
   return UploadRanges(upload_ranges_);
 }
 
@@ -593,6 +800,7 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 
   const uint32_t page_first = start >> page_size_log2_;
   const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  RevalidateGuestPages(page_first, page_last);
   const uint32_t block_first = page_first >> 6;
   const uint32_t block_last = page_last >> 6;
 
@@ -687,6 +895,7 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
     return true;
   }
 
+  // Page hashes are stored by UploadRanges from the uploaded bytes (StoreUploadedPageHashes).
   return UploadRanges(upload_ranges_);
 }
 

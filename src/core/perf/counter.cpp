@@ -30,6 +30,9 @@ REXCVAR_DEFINE_BOOL(perf_diagnostics, false, "Perf",
 REXCVAR_DEFINE_BOOL(perf_draw_fingerprints, false, "Perf",
                     "Collect per-frame draw fingerprints outside explicit captures")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(perf_counters_enabled, !REX_PLATFORM_SWITCH2, "Perf",
+                    "Update the per-frame perf counters (read by the debug overlay)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(perf_capture_frames, 120, "Perf",
                      "Number of frames to collect for F8 performance captures")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -581,9 +584,19 @@ void SetCounter(CounterId id, int64_t value) {
   g_counters[static_cast<size_t>(id)].store(value, std::memory_order_relaxed);
 }
 
+#if REX_PLATFORM_SWITCH2
+namespace detail {
+std::atomic<bool> g_counters_enabled{false};
+std::atomic<bool> g_draw_diagnostics_cached{false};
+void IncrementCounterSlow(CounterId id, int64_t delta) {
+  g_counters[static_cast<size_t>(id)].fetch_add(delta, std::memory_order_relaxed);
+}
+}  // namespace detail
+#else
 void IncrementCounter(CounterId id, int64_t delta) {
   g_counters[static_cast<size_t>(id)].fetch_add(delta, std::memory_order_relaxed);
 }
+#endif
 
 void RecordDrawBucket(DrawBucket bucket, int64_t vertices, int64_t primitives) {
   CounterId calls_id;
@@ -684,9 +697,11 @@ bool IsCaptureRecording() {
   return g_capture_recording.load(std::memory_order_acquire);
 }
 
+#if !REX_PLATFORM_SWITCH2
 bool ShouldCollectDrawDiagnostics() {
   return REXCVAR_GET(perf_diagnostics) || IsCaptureRecording();
 }
+#endif
 
 bool ShouldCollectDrawFingerprints() {
   return REXCVAR_GET(perf_draw_fingerprints) || ShouldCollectDrawDiagnostics();
@@ -697,6 +712,11 @@ int64_t GetCounter(CounterId id) {
 }
 
 void ResetFrameCounters() {
+#if REX_PLATFORM_SWITCH2
+  detail::g_draw_diagnostics_cached.store(REXCVAR_GET(perf_diagnostics) || IsCaptureRecording(),
+                                          std::memory_order_relaxed);
+  detail::g_counters_enabled.store(REXCVAR_GET(perf_counters_enabled), std::memory_order_relaxed);
+#endif
   for (size_t i = 0; i < kNumCounters; ++i) {
     if (kIsGauge[i]) {
       // Gauges: snapshot the current value, don't zero

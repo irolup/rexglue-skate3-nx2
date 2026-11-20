@@ -22,6 +22,17 @@ REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
 
+REXCVAR_DEFINE_INT32(clock_max_gap_ms, REX_PLATFORM_SWITCH2 ? 250 : 0, "Clock",
+                     "If the host clock advanced more than this between two guest clock updates "
+                     "(the process was suspended, e.g. by the HOME menu), advance the guest clock "
+                     "by one frame only instead of the whole gap (0 = off)");
+
+// Suspension gaps absorbed by the guest clock (read by the platform layer for logging).
+extern "C" {
+uint64_t rex_clock_gap_events = 0;
+uint64_t rex_clock_gap_ms_total = 0;
+}
+
 namespace rex::chrono {
 
 // Time scalar applied to all time operations.
@@ -77,6 +88,21 @@ uint64_t UpdateGuestClock() {
     uint64_t host_tick_delta =
         host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
     last_host_tick_count_ = host_tick_count;
+    {
+      const int32_t max_gap_ms = REXCVAR_GET(clock_max_gap_ms);
+      if (max_gap_ms > 0) {
+        const uint64_t host_frequency = Clock::QueryHostTickFrequency();
+        const uint64_t max_gap_ticks = host_frequency * uint64_t(max_gap_ms) / 1000;
+        if (host_tick_delta > max_gap_ticks) {
+          // No guest thread read the clock for that long: the process was suspended. Hide the
+          // gap from the game (a game loop catching up tens of seconds locks up).
+          __atomic_add_fetch(&rex_clock_gap_events, 1, __ATOMIC_RELAXED);
+          __atomic_add_fetch(&rex_clock_gap_ms_total, host_tick_delta * 1000 / host_frequency,
+                             __ATOMIC_RELAXED);
+          host_tick_delta = host_frequency / 60;
+        }
+      }
+    }
     uint64_t guest_tick_delta =
         host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
     last_guest_tick_count_ += guest_tick_delta;
