@@ -620,30 +620,23 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
       auto global_lock = global_critical_region_.AcquireDeferred();
       while (dispatch_thread_running_) {
+        // Wait in 100 ms slices (safety net) inside a `while`, which also guards against spurious
+        // wakeups (front() of an empty queue). The earlier "lost wakeup" on Switch 2 was really
+        // the thread never starting (see PosixCondition<Thread>::ThreadStartRoutine).
+        global_lock.lock();
 #if REX_PLATFORM_SWITCH2
-        // Switch 2: no condition_variable_any (its wakeup was lost with the global recursive mutex
-        // on libounce: XamShowDeviceSelectorUI's completion never ran and the game hung after
-        // Start). Poll the queue under the global lock; sleep 1 ms when it is empty.
         g_dispatch_heartbeat.fetch_add(1, std::memory_order_relaxed);
-        global_lock.lock();
-        if (dispatch_queue_.empty()) {
-          global_lock.unlock();
-          if (!dispatch_thread_running_) {
-            break;
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-          continue;
-        }
-#else
-        global_lock.lock();
+#endif
         while (dispatch_queue_.empty() && dispatch_thread_running_) {
-          dispatch_cond_.wait(global_lock);
+          dispatch_cond_.wait_for(global_lock, std::chrono::milliseconds(100));
+#if REX_PLATFORM_SWITCH2
+          g_dispatch_heartbeat.fetch_add(1, std::memory_order_relaxed);
+#endif
         }
         if (!dispatch_thread_running_) {
           global_lock.unlock();
           break;
         }
-#endif
         auto fn = std::move(dispatch_queue_.front());
         dispatch_queue_.pop_front();
         REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",

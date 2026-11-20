@@ -852,6 +852,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                               draw_util::ResolveCopyShaderIndex copy_shader,
                               bool draw_resolution_scaled, VulkanSharedMemory& shared_memory,
                               const draw_util::ResolveCopyShaderConstants& copy_shader_constants);
+  // ns2_resolve_to_texture: after a direct raw 32bpp resolve, copy the resolved pixels from the
+  // render target image into the cached textures that the resolve fully rewrote.
+  // Returns the outcome for the diagnostics (see Ns2ResolveOutcomeName).
+  uint32_t Ns2ResolveIntoTextures(const draw_util::ResolveInfo& resolve_info,
+                                  draw_util::ResolveCopyShaderIndex copy_shader,
+                                  VulkanTextureCache& texture_cache, std::string& detail_out);
+  // Diagnostics (ns2_debug): per destination address, how resolves are done every 5 s.
+  void Ns2RecordResolve(const draw_util::ResolveInfo& resolve_info,
+                        draw_util::ResolveCopyShaderIndex copy_shader, bool direct,
+                        uint32_t r2t_outcome, const std::string& r2t_detail);
 
   // Deferred resolve clears: instead of an own render pass with a rectangle
   // attachment clear per resolve, clears are accumulated on the render target

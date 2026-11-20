@@ -11,8 +11,10 @@
  */
 
 #include <array>
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -132,6 +134,21 @@ class VulkanTextureCache final : public TextureCache {
                                               length_scaled_alignment_log2);
   }
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
+
+  // Switch 2 (ns2_resolve_to_texture): after a raw 32bpp k_8_8_8_8 resolve to dest_base (tiled,
+  // pitch in 32-texel units, destination origin at 0,0, width x height resolved), copies the
+  // resolved pixels from the source render target image (top-left at source_x/y, 1x scale)
+  // straight into the cached k_8_8_8_8 textures fully covered by the resolve, and marks them up
+  // to date so they are not reloaded from memory. prepare_source is called once before the first
+  // copy (it must transition the source to TRANSFER_SRC_OPTIMAL). Returns the textures written.
+  // reason_out (when nothing was written): 1 no texture known at this address, 2 pitch/endian/size
+  // mismatch, 3 texture not outdated, 4 could not be marked up to date. detail_out describes the
+  // first mismatching texture.
+  uint32_t Ns2CopyResolveToTextures(uint32_t dest_base, uint32_t dest_pitch_div_32,
+                                    uint32_t dest_endian, uint32_t width, uint32_t height,
+                                    VkImage source_image, int32_t source_x, int32_t source_y,
+                                    const std::function<void()>& prepare_source,
+                                    uint32_t& reason_out, std::string& detail_out);
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
@@ -153,6 +170,7 @@ class VulkanTextureCache final : public TextureCache {
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+  void Ns2AfterEagerLoad(Texture& texture) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
@@ -356,6 +374,11 @@ class VulkanTextureCache final : public TextureCache {
                                   VkAccessFlags& access_mask_out, bool write) const;
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
+
+  // ns2_resolve_to_texture: keys of loaded textures that a raw 32bpp resolve can write directly,
+  // by guest base address.
+  void Ns2IndexResolveTexture(const VulkanTexture& texture);
+  std::unordered_map<uint32_t, std::vector<TextureKey>> ns2_resolve_texture_keys_;
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;

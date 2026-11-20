@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -30,8 +32,33 @@
 
 namespace rex::graphics {
 
+// Switch 2 handheld experiments: render target ownership transfer statistics (taken and reset by
+// the "RT transfers" diagnostics line every 5 s).
+struct Ns2RtTransferStats {
+  // Source -> destination ranges that the original code would transfer, and their tiles.
+  uint64_t candidate_ranges = 0;
+  uint64_t candidate_tiles = 0;
+  // ns2_rt_valid_tracking: tiles not copied because the destination still held them, and ranges
+  // dropped entirely for that reason.
+  uint64_t valid_skipped_tiles = 0;
+  uint64_t valid_skipped_ranges = 0;
+  // Transfers whose triggering draw looks like a full overwrite (depth ALWAYS + write, or opaque
+  // color with all channels, quad-sized primitive, no alpha test) - and how many tiles
+  // ns2_rt_skip_overwritten_transfers dropped because of it.
+  uint64_t overwrite_like_transfers = 0;
+  uint64_t overwrite_skipped_tiles = 0;
+  // Draws that marked tiles as written (validity tracking).
+  uint64_t write_marks = 0;
+};
+void Ns2TakeRtTransferStats(Ns2RtTransferStats& out);
+
 class RenderTargetCache {
  public:
+  // Switch 2 diagnostics: per transfer pair, how many triggering draws are quad-sized /
+  // overwriting / non-discarding (taken and reset).
+  static std::string Ns2TakeTriggerStats();
+  static std::string Ns2DescribeKey(uint32_t key_value);
+
   // High-level emulation logic implementation path.
   enum class Path {
     // Approximate method using conventional host render targets and copying
@@ -669,6 +696,40 @@ class RenderTargetCache {
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+
+  // Switch 2 handheld experiments (see Ns2RtTransferStats at the top).
+  // ns2_rt_valid_tracking: every EDRAM tile has a content version; each render target remembers the
+  // version its image holds per tile. Draws mark the tiles they may write (scissor rectangle x
+  // estimated height) as pending on the owner; the pending tiles get a new version when the owner
+  // loses them. A transfer into a render target is only needed for the tiles where its image does
+  // not hold the current version (A -> B -> A ping-pong only copies back what B wrote).
+  struct Ns2RtValidity {
+    // Tile content version held by this render target's image (0 = unknown).
+    uint32_t held[xenos::kEdramTileCount];
+    // Tiles written while owning them, not yet published to ns2_tile_version_.
+    uint64_t pending[xenos::kEdramTileCount / 64];
+  };
+  bool Ns2ValidityActive();
+  Ns2RtValidity& Ns2GetValidity(RenderTargetKey key);
+  // Publishes the owner's pending writes in [start_tiles, end_tiles) (absolute, no wrap).
+  void Ns2PublishPending(RenderTargetKey owner, uint32_t start_tiles, uint32_t end_tiles);
+  // The render target's image holds the current contents of [start_tiles, end_tiles).
+  void Ns2MarkHeld(RenderTargetKey key, uint32_t start_tiles, uint32_t end_tiles);
+  // Marks the tiles a write of the guest pixel rectangle [x0, x1) x [y0, y1) can touch as pending
+  // (within the claimed range, relative to the base) or as no longer held (outside it).
+  void Ns2MarkWritten(RenderTargetKey key, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                      uint32_t claim_start_tiles_base_relative, uint32_t claim_length_tiles);
+  // After the ownership changes of a draw: marks its writes (validity tracking), classifies the
+  // transfers it triggered and drops the fully overwritten ones (ns2_rt_skip_overwritten_transfers).
+  void Ns2AfterOwnershipUpdate(reg::RB_DEPTHCONTROL normalized_depth_control,
+                               uint32_t normalized_color_mask, uint32_t height_used,
+                               const RenderTargetKey* rt_keys,
+                               const std::pair<uint32_t, uint32_t>* edram_bases_sorted,
+                               uint32_t edram_bases_sorted_count, const uint32_t* rt_lengths_tiles);
+  std::unordered_map<uint32_t, std::unique_ptr<Ns2RtValidity>> ns2_validity_;
+  uint32_t ns2_tile_version_[xenos::kEdramTileCount] = {};
+  uint32_t ns2_version_counter_ = 1;
+  bool ns2_validity_was_active_ = false;
 
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.

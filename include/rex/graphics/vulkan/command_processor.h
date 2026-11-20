@@ -937,6 +937,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
   // but in_render_pass_ is true.
+ public:
+  bool ns2_in_render_pass() const { return in_render_pass_; }
+
+ private:
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;

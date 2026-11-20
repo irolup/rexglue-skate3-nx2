@@ -178,6 +178,12 @@ REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 0, "GPU/Vulkan",
 
 #if REX_PLATFORM_SWITCH2
 extern "C" void ns2_take_global_lock_stats(uint64_t* contended, uint64_t* blocked);
+extern "C" void ns2_clock_check(uint32_t* cpu_mhz, uint32_t* gpu_mhz, uint32_t* resets,
+                                uint32_t* mem_mhz, uint32_t* cpu_bench_us);
+// A/B experiment cycler (platform/ui_switch2.cpp): label of the 5 s window that just ended, then
+// switches to the next phase if due; ns2_ab_label: label of the current phase.
+extern "C" const char* ns2_ab_tick(uint32_t avg_draws);
+extern "C" const char* ns2_ab_label();
 #endif
 namespace rex::graphics {
 void TakeCommandProcessorWaitStats(uint64_t& wait_reg_mem_us, uint64_t& frame_limit_sleep_us,
@@ -2725,14 +2731,23 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 #if REX_PLATFORM_SWITCH2
       ns2_take_global_lock_stats(&lock_contended, &lock_blocked);
 #endif
+      uint32_t clock_cpu_mhz = 0, clock_gpu_mhz = 0, clock_resets = 0, clock_mem_mhz = 0,
+               clock_bench_us = 0;
+#if REX_PLATFORM_SWITCH2
+      ns2_clock_check(&clock_cpu_mhz, &clock_gpu_mhz, &clock_resets, &clock_mem_mhz,
+                      &clock_bench_us);
+      const char* ab_label = ns2_ab_tick(frame_avg_draws);
+#else
+      const char* ab_label = "-";
+#endif
       REXGPU_INFO(
-          "GPU stats: {} swaps in {} ms ({} withheld for placeholder pipelines), {} draws "
+          "GPU stats [{}]: {} swaps in {} ms ({} withheld for placeholder pipelines), {} draws "
           "({} placeholder), consecutive_skips={}, revalidated_pages={}, hash_ms={}, hashed_MB[sample={} full={} force={} upload={} gpuwr={}], "
           "wait_reg_mem_ms={} (longest on {} 0x{:08X}), frame_limit_sleep_ms={}, "
           "host_gpu_frame_us[avg={} max={} n={} draw={} resolve={} dump={}], "
           "global_lock[contended={} blocked={}], frames[>20ms={} >25ms={} max={}us "
-          "(wait_reg_mem {}us, {} draws) avg_draws={}]",
-          stats_swaps, uint32_t(now_ms - stats_last_ms), stats_skipped, stats_draws,
+          "(wait_reg_mem {}us, {} draws) avg_draws={}], clocks[cpu={} gpu={} mem={} resets={} cpu_bench_us={}]",
+          ab_label, stats_swaps, uint32_t(now_ms - stats_last_ms), stats_skipped, stats_draws,
           stats_placeholder, async_placeholder_consecutive_frame_skips_,
           shared_memory_ ? shared_memory_->TakeRevalidatedPageCount() : 0u,
           shared_memory_ ? uint32_t(shared_memory_->TakeRevalidateMicros() / 1000) : 0u,
@@ -2745,7 +2760,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           gpu_frame_span_count_ ? uint32_t(gpu_frame_resolve_sum_us_ / gpu_frame_span_count_) : 0u,
           gpu_frame_span_count_ ? uint32_t(gpu_frame_dump_sum_us_ / gpu_frame_span_count_) : 0u,
           lock_contended, lock_blocked, frames_over_17, frames_over_25, frame_max_us,
-          frame_max_wait_us, frame_max_draws, frame_avg_draws);
+          frame_max_wait_us, frame_max_draws, frame_avg_draws, clock_cpu_mhz, clock_gpu_mhz,
+          clock_mem_mhz, clock_resets, clock_bench_us);
       gpu_frame_draw_sum_us_ = gpu_frame_resolve_sum_us_ = gpu_frame_dump_sum_us_ = 0;
       gpu_frame_span_sum_us_ = gpu_frame_span_max_us_ = 0;
       gpu_frame_span_count_ = 0;
@@ -6536,10 +6552,15 @@ void VulkanCommandProcessor::ProcessGpuTimestampResults() {
         }
         uint64_t span_avg_us = gpu_profile_span_us_ / gpu_profile_frames_;
         uint64_t sum_avg_us = buckets_sum_us / gpu_profile_frames_;
+#if REX_PLATFORM_SWITCH2
+        const char* profile_ab_label = ns2_ab_label();
+#else
+        const char* profile_ab_label = "-";
+#endif
         REXGPU_INFO(
-            "Vulkan GPU profile (avg us/frame over {} frames): span={} buckets={} untimed={} "
+            "Vulkan GPU profile [{}] (avg us/frame over {} frames): span={} buckets={} untimed={} "
             "submissions={} queries={}/{} |{}",
-            gpu_profile_frames_, span_avg_us, sum_avg_us,
+            profile_ab_label, gpu_profile_frames_, span_avg_us, sum_avg_us,
             span_avg_us > sum_avg_us ? span_avg_us - sum_avg_us : 0,
             gpu_profile_submissions_ / gpu_profile_frames_, frame.query_count,
             kMaxGpuTimestampQueriesPerFrame, breakdown);

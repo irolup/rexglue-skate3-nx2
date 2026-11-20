@@ -99,6 +99,24 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_inexact_rt_transfers, false, "GPU/Vulkan",
 //     "always FB because the FSI path is much slower now).",
 //     "GPU");
 
+extern "C" bool ns2_debug_enabled();  // platform/windowed_app_main_switch2.cpp
+extern "C" const char* ns2_ab_label();  // platform/ui_switch2.cpp (A/B phase of the stats window)
+extern "C" bool ns2_ab_cycle_enabled();  // platform/ui_switch2.cpp
+REXCVAR_DECLARE(bool, ns2_resolve_to_texture);  // vulkan/texture_cache.cpp
+
+namespace {
+// Color render targets get TRANSFER_SRC usage (for ns2_resolve_to_texture copies) only if the
+// feature can be enabled in this run, so the default path keeps the original image usage.
+bool Ns2RenderTargetsTransferSource() {
+#if REX_PLATFORM_SWITCH2
+  static const bool enabled = REXCVAR_GET(ns2_resolve_to_texture) || ns2_ab_cycle_enabled();
+  return enabled;
+#else
+  return REXCVAR_GET(ns2_resolve_to_texture);
+#endif
+}
+}  // namespace
+
 namespace rex::graphics::vulkan {
 
 #if REX_PLATFORM_SWITCH2
@@ -1500,6 +1518,15 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         // dispatches.
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length);
+        {
+          uint32_t r2t_outcome = 0;
+          std::string r2t_detail;
+          if (REXCVAR_GET(ns2_resolve_to_texture) && Ns2RenderTargetsTransferSource()) {
+            r2t_outcome =
+                Ns2ResolveIntoTextures(resolve_info, copy_shader, texture_cache, r2t_detail);
+          }
+          Ns2RecordResolve(resolve_info, copy_shader, true, r2t_outcome, r2t_detail);
+        }
         written_address_out = resolve_info.copy_dest_extent_start;
         written_length_out = resolve_info.copy_dest_extent_length;
         copied = true;
@@ -1667,6 +1694,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          {
+            uint32_t r2t_outcome = 0;
+            std::string r2t_detail;
+            if (!draw_resolution_scaled && REXCVAR_GET(ns2_resolve_to_texture) &&
+                Ns2RenderTargetsTransferSource()) {
+              r2t_outcome =
+                  Ns2ResolveIntoTextures(resolve_info, copy_shader, texture_cache, r2t_detail);
+            }
+            Ns2RecordResolve(resolve_info, copy_shader, false, r2t_outcome, r2t_detail);
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -2337,6 +2374,9 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (Ns2RenderTargetsTransferSource()) {
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
   }
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
@@ -5018,8 +5058,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   }
 #if REX_PLATFORM_SWITCH2
   // Transfer diagnostics: every 5 s, log the most frequent (source -> destination) ownership
-  // transfer pairs with their counts and EDRAM tiles.
-  {
+  // transfer pairs with their counts and EDRAM tiles (ns2_debug only).
+  static const bool ns2_debug = ns2_debug_enabled();
+  if (ns2_debug) {
     struct PairStats {
       uint64_t count = 0;
       uint64_t tiles = 0;
@@ -5094,10 +5135,19 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                            sorted[k].second.tiles / std::max<uint64_t>(1, sorted[k].second.count),
                            sorted[k].second.host_depth ? " hostdepth" : "");
       }
-      REXGPU_INFO("RT transfers in {} ms: {} transfers ({} from a resolve-cleared source, {} from "
-                  "a source that wrote nothing since taking over), {} resolve clears, {} pairs |{}",
-                  uint32_t(now_ms - window_start_ms), total, g_transfers_from_cleared,
-                  g_transfers_from_unwritten, resolve_clears, sorted.size(), top);
+      Ns2RtTransferStats ns2_stats;
+      Ns2TakeRtTransferStats(ns2_stats);
+      REXGPU_INFO("RT transfers in {} ms [{}]: {} transfers ({} from a resolve-cleared source, {} "
+                  "from a source that wrote nothing since taking over), {} resolve clears, {} "
+                  "pairs |{} | ranges={} tiles={} valid_skip[tiles={} ranges={}] "
+                  "overwrite[like={} skipped_tiles={}] write_marks={}",
+                  uint32_t(now_ms - window_start_ms), ns2_ab_label(), total,
+                  g_transfers_from_cleared, g_transfers_from_unwritten, resolve_clears,
+                  sorted.size(), top, ns2_stats.candidate_ranges, ns2_stats.candidate_tiles,
+                  ns2_stats.valid_skipped_tiles, ns2_stats.valid_skipped_ranges,
+                  ns2_stats.overwrite_like_transfers, ns2_stats.overwrite_skipped_tiles,
+                  ns2_stats.write_marks);
+      REXGPU_INFO("RT transfer triggers [{}]:{}", ns2_ab_label(), Ns2TakeTriggerStats());
       g_transfers_from_cleared = 0;
       g_transfers_from_unwritten = 0;
       pair_stats.clear();
@@ -6961,6 +7011,176 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(
         resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length);
   }
   return true;
+}
+
+namespace {
+// Outcomes of ns2_resolve_to_texture per resolve (0 = switch off).
+const char* Ns2ResolveOutcomeName(uint32_t outcome) {
+  static const char* const kNames[] = {
+      "off",           "copied",        "not-raw32",      "depth",        "owners!=1",
+      "rt-not-1x8888", "dest-format",   "dest-offset",    "pitch",        "src-outside",
+      "no-texture",    "tex-mismatch",  "tex-not-stale",  "tex-mark-fail"};
+  return outcome < sizeof(kNames) / sizeof(kNames[0]) ? kNames[outcome] : "?";
+}
+}  // namespace
+
+uint32_t VulkanRenderTargetCache::Ns2ResolveIntoTextures(
+    const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
+    VulkanTextureCache& texture_cache, std::string& detail_out) {
+  // Raw copy of a single single-sampled k_8_8_8_8 owner (the bits in memory are the render
+  // target's bits, so the texture load would produce exactly the render target's pixels).
+  if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) {
+    return 2;
+  }
+  if (resolve_info.IsCopyingDepth()) {
+    return 3;
+  }
+  if (dump_rectangles_.size() != 1 || !dump_rectangles_[0].render_target) {
+    detail_out = fmt::format("{} owners", dump_rectangles_.size());
+    return 4;
+  }
+  auto& render_target = *static_cast<VulkanRenderTarget*>(dump_rectangles_[0].render_target);
+  RenderTargetKey rt_key = render_target.key();
+  if (rt_key.is_depth || rt_key.msaa_samples != xenos::MsaaSamples::k1X ||
+      rt_key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+    detail_out = rt_key.GetDebugName();
+    return 5;
+  }
+  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
+  if (dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest_info.copy_dest_swap ||
+      dest_info.copy_dest_exp_bias || dest_info.copy_dest_array ||
+      uint32_t(dest_info.copy_dest_endian) > uint32_t(xenos::Endian128::k16in32)) {
+    detail_out = fmt::format("format={} swap={} bias={} array={} endian={}",
+                             uint32_t(dest_info.copy_dest_format),
+                             uint32_t(dest_info.copy_dest_swap),
+                             int32_t(dest_info.copy_dest_exp_bias),
+                             uint32_t(dest_info.copy_dest_array),
+                             uint32_t(dest_info.copy_dest_endian));
+    return 6;
+  }
+  const draw_util::ResolveCopyDestCoordinateInfo& dest_coordinate_info =
+      resolve_info.copy_dest_coordinate_info;
+  if (dest_coordinate_info.offset_x_div_8 || dest_coordinate_info.offset_y_div_8) {
+    detail_out = fmt::format("dest offset {},{}", uint32_t(dest_coordinate_info.offset_x_div_8) << 3,
+                             uint32_t(dest_coordinate_info.offset_y_div_8) << 3);
+    return 7;
+  }
+  const draw_util::ResolveEdramInfo& edram_info = resolve_info.color_edram_info;
+  uint32_t pitch_tiles = rt_key.GetPitchTiles();
+  if (!pitch_tiles || edram_info.pitch_tiles != pitch_tiles) {
+    detail_out = fmt::format("edram pitch {} rt pitch {}", uint32_t(edram_info.pitch_tiles),
+                             pitch_tiles);
+    return 8;
+  }
+  uint32_t local_tiles =
+      (uint32_t(edram_info.base_tiles) - rt_key.base_tiles) & (xenos::kEdramTileCount - 1);
+  uint32_t source_x = (local_tiles % pitch_tiles) * xenos::kEdramTileWidthSamples +
+                      (uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3);
+  uint32_t source_y = (local_tiles / pitch_tiles) * xenos::kEdramTileHeightSamples +
+                      (uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3);
+  uint32_t rt_width = pitch_tiles * xenos::kEdramTileWidthSamples;
+  uint32_t rt_height = GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples);
+  if (source_x >= rt_width || source_y >= rt_height) {
+    detail_out = fmt::format("source {},{} rt {}x{}", source_x, source_y, rt_width, rt_height);
+    return 9;
+  }
+  uint32_t width =
+      std::min(uint32_t(resolve_info.coordinate_info.width_div_8) << 3, rt_width - source_x);
+  uint32_t height = std::min(uint32_t(resolve_info.height_div_8) << 3, rt_height - source_y);
+  uint32_t texture_reason = 1;
+  uint32_t written = texture_cache.Ns2CopyResolveToTextures(
+      resolve_info.copy_dest_base, dest_coordinate_info.pitch_aligned_div_32,
+      uint32_t(dest_info.copy_dest_endian), width, height, render_target.image(),
+      int32_t(source_x), int32_t(source_y),
+      [&]() {
+        command_processor_.PushImageMemoryBarrier(
+            render_target.image(),
+            ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+            render_target.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+            render_target.current_access_mask(), VK_ACCESS_TRANSFER_READ_BIT,
+            render_target.current_layout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        render_target.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      },
+      texture_reason, detail_out);
+  if (written) {
+    return 1;
+  }
+  return 9 + texture_reason;
+}
+
+void VulkanRenderTargetCache::Ns2RecordResolve(const draw_util::ResolveInfo& resolve_info,
+                                               draw_util::ResolveCopyShaderIndex copy_shader,
+                                               bool direct, uint32_t r2t_outcome,
+                                               const std::string& r2t_detail) {
+#if REX_PLATFORM_SWITCH2
+  static const bool enabled = ns2_debug_enabled();
+  if (!enabled) {
+    return;
+  }
+  struct DestStats {
+    uint64_t count = 0;
+    uint64_t direct = 0;
+    uint32_t shader = 0;
+    uint32_t source = 0;  // depth << 31 | msaa << 8 | format
+    uint32_t dest_format = 0;
+    uint32_t width = 0, height = 0;
+    uint64_t outcome_counts[16] = {};
+    std::string detail;
+  };
+  static std::unordered_map<uint32_t, DestStats> stats;
+  static uint64_t window_start_ms = 0;
+  bool is_depth = resolve_info.IsCopyingDepth();
+  const draw_util::ResolveEdramInfo& edram_info =
+      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  DestStats& entry = stats[resolve_info.copy_dest_base];
+  ++entry.count;
+  entry.direct += direct;
+  entry.shader = uint32_t(copy_shader);
+  entry.source = (uint32_t(is_depth) << 31) | (uint32_t(edram_info.msaa_samples) << 8) |
+                 uint32_t(edram_info.format);
+  entry.dest_format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+  entry.width = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
+  entry.height = uint32_t(resolve_info.height_div_8) << 3;
+  ++entry.outcome_counts[std::min(r2t_outcome, uint32_t(15))];
+  if (!r2t_detail.empty()) {
+    entry.detail = r2t_detail;
+  }
+  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+  if (!window_start_ms) {
+    window_start_ms = now_ms;
+  }
+  if (now_ms - window_start_ms < 5000) {
+    return;
+  }
+  std::vector<std::pair<uint32_t, DestStats>> sorted(stats.begin(), stats.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+  std::string text;
+  uint64_t total = 0;
+  for (const auto& e : sorted) {
+    total += e.second.count;
+  }
+  for (size_t k = 0; k < sorted.size() && k < 14; ++k) {
+    const DestStats& d = sorted[k].second;
+    std::string outcomes;
+    for (uint32_t o = 0; o < 16; ++o) {
+      if (d.outcome_counts[o]) {
+        outcomes += fmt::format("{}{}={}", outcomes.empty() ? "" : ",", Ns2ResolveOutcomeName(o),
+                                d.outcome_counts[o]);
+      }
+    }
+    text += fmt::format(" {:08X}:n={} {} shader={} src={}{}x{} dst_fmt={} {}x{} r2t[{}]{}{}",
+                        sorted[k].first, d.count, d.direct == d.count ? "direct" : (d.direct ? "mixed" : "dump"),
+                        d.shader, (d.source >> 31) ? "D" : "C", d.source & 0xFF,
+                        1u << ((d.source >> 8) & 3), d.dest_format, d.width, d.height, outcomes,
+                        d.detail.empty() ? "" : " ", d.detail.empty() ? "" : "(" + d.detail + ")");
+  }
+  REXGPU_INFO("Resolves in {} ms [{}]: {} resolves to {} addresses |{}",
+              uint32_t(now_ms - window_start_ms), ns2_ab_label(), total, sorted.size(), text);
+  stats.clear();
+  window_start_ms = now_ms;
+#endif
 }
 
 VkClearDepthStencilValue VulkanRenderTargetCache::GetResolveClearDepthStencilValue(

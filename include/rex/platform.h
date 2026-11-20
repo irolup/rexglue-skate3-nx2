@@ -213,15 +213,9 @@ __attribute__((always_inline)) inline int64_t rex_s2_fold_delta(uint32_t a) {
 #endif
 
 #if REX_PLATFORM_SWITCH2
-#include <cstdio>
-// Unbuffered step trace for on-device bring-up (survives hard crashes).
-inline void rex_s2_trace(const char* msg) {
-  if (FILE* f = std::fopen("sdmc:/switch/skate3/trace.txt", "a")) {
-    std::fprintf(f, "%s\n", msg);
-    std::fflush(f);
-    std::fclose(f);
-  }
-}
+// Unbuffered step trace for on-device bring-up (survives hard crashes): sdmc:/switch/skate3/
+// trace.txt, written only with ns2_debug=true (defined by the Switch 2 platform layer).
+extern "C" void rex_s2_trace(const char* msg);
 #define REX_S2_TRACE(m) rex_s2_trace(m)
 #else
 #define REX_S2_TRACE(m) ((void)0)

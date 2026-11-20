@@ -57,6 +57,13 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(ns2_eager_texture_loads, false, "GPU",
+                    "Reload textures that are known to be read after a resolve right after that "
+                    "resolve (where the render pass is already broken) instead of in the middle of "
+                    "a later render pass. Learned per resolve address; entries whose eager loads "
+                    "go unused are dropped")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(anisotropic_override, -1, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
@@ -369,9 +376,29 @@ std::unordered_map<uint32_t, TextureLoadStats> g_texture_load_stats;
 uint64_t g_texture_load_window_ms = 0;
 }  // namespace
 
+extern "C" bool ns2_debug_enabled();  // platform/windowed_app_main_switch2.cpp
+extern "C" const char* ns2_ab_label();  // platform/ui_switch2.cpp
+namespace {
+uint64_t g_resolve_texture_copies = 0;
+uint64_t g_resolve_texture_copy_bytes = 0;
+uint64_t g_loads_in_pass = 0;
+}  // namespace
+uint64_t g_ns2_eager_loads = 0, g_ns2_eager_hits = 0, g_ns2_eager_wastes = 0,
+         g_ns2_eager_skipped = 0, g_ns2_eager_learned = 0;
+// Texture loads issued while a render pass was open (each one breaks the pass).
+void Ns2RecordTextureLoadInPass() { ++g_loads_in_pass; }
+// ns2_resolve_to_texture: a texture written straight from the render target by a resolve.
+void Ns2RecordResolveTextureCopy(uint32_t bytes) {
+  ++g_resolve_texture_copies;
+  g_resolve_texture_copy_bytes += bytes;
+}
 // Called for every texture load (all paths) by the host texture cache.
 void Ns2RecordTextureLoad(uint32_t base, uint32_t size, uint32_t width, uint32_t height,
                           uint32_t format, bool hash_changed_recently) {
+  static const bool enabled = ns2_debug_enabled();
+  if (!enabled) {
+    return;
+  }
   size = std::max(size, uint32_t(1));
   bool from_resolve = false;
   for (const RecentResolve& r : g_recent_resolves) {
@@ -411,10 +438,18 @@ void Ns2RecordTextureLoad(uint32_t base, uint32_t size, uint32_t width, uint32_t
                          e.second.height, e.second.format, e.second.bytes >> 10, e.second.count,
                          e.second.from_resolve, e.second.from_hash);
     }
-    REXGPU_INFO("Texture loads in {} ms: {} loads ({} after a resolve, {} after a detected memory "
-                "change), {} MB, {} textures |{}",
-                uint32_t(now_ms - g_texture_load_window_ms), total, total_resolve, total_hash,
-                uint32_t(total_bytes >> 20), sorted.size(), top);
+    REXGPU_INFO("Texture loads in {} ms [{}]: {} loads ({} after a resolve, {} after a detected "
+                "memory change), {} MB, {} textures, resolve_to_texture copies={} ({} MB), "
+                "in_pass={} eager[loads={} hits={} wastes={} skipped={} learned={}] |{}",
+                uint32_t(now_ms - g_texture_load_window_ms), ns2_ab_label(), total, total_resolve,
+                total_hash, uint32_t(total_bytes >> 20), sorted.size(), g_resolve_texture_copies,
+                uint32_t(g_resolve_texture_copy_bytes >> 20), g_loads_in_pass, g_ns2_eager_loads,
+                g_ns2_eager_hits, g_ns2_eager_wastes, g_ns2_eager_skipped, g_ns2_eager_learned,
+                top);
+    g_resolve_texture_copies = 0;
+    g_resolve_texture_copy_bytes = 0;
+    g_loads_in_pass = 0;
+    g_ns2_eager_loads = g_ns2_eager_hits = g_ns2_eager_wastes = g_ns2_eager_skipped = 0;
     g_texture_load_stats.clear();
     g_texture_load_window_ms = now_ms;
   }
@@ -426,7 +461,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
     return;
   }
 #if REX_PLATFORM_SWITCH2
-  {
+  if (ns2_debug_enabled()) {
     const uint32_t start = start_unscaled & 0x1FFFFFFF;
     g_recent_resolves[g_recent_resolve_next++ % 128] = {start, start + length_unscaled};
   }
@@ -456,6 +491,116 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+
+  if (REXCVAR_GET(ns2_eager_texture_loads)) {
+    Ns2EagerLoadAfterResolve(start_unscaled, length_unscaled);
+  }
+}
+
+#if !REX_PLATFORM_SWITCH2
+static uint64_t g_ns2_eager_loads = 0, g_ns2_eager_hits = 0, g_ns2_eager_wastes = 0,
+                g_ns2_eager_skipped = 0, g_ns2_eager_learned = 0;
+#endif
+
+void TextureCache::Ns2EagerCount(uint32_t resolve_start, const TextureKey& key, bool hit) {
+  auto it = ns2_eager_entries_.find(resolve_start);
+  if (it == ns2_eager_entries_.end()) {
+    return;
+  }
+  for (Ns2EagerEntry& entry : it->second) {
+    if (entry.key == key) {
+      if (hit) {
+        ++entry.hits;
+        ++g_ns2_eager_hits;
+      } else {
+        ++entry.wastes;
+        ++g_ns2_eager_wastes;
+      }
+      return;
+    }
+  }
+}
+
+void TextureCache::Ns2EagerLoadAfterResolve(uint32_t start, uint32_t length) {
+  Ns2RecentResolve& recent = ns2_recent_resolves_[ns2_recent_resolve_next_++ %
+                                                   (sizeof(ns2_recent_resolves_) /
+                                                    sizeof(ns2_recent_resolves_[0]))];
+  recent.start = start;
+  recent.end = start + length;
+  auto it = ns2_eager_entries_.find(start);
+  if (it == ns2_eager_entries_.end()) {
+    return;
+  }
+  for (size_t i = 0; i < it->second.size(); ++i) {
+    // Copy: loading may add entries for other addresses (no rehash of this vector though).
+    Ns2EagerEntry entry = it->second[i];
+    if (entry.wastes > entry.hits + 2) {
+      ++g_ns2_eager_skipped;
+      continue;
+    }
+    Texture* texture = Ns2FindExistingTexture(entry.key);
+    if (!texture || !(texture->outdated_mask() & Texture::kOutdatedBitBase)) {
+      continue;
+    }
+    auto pending_it = ns2_eager_pending_.find(entry.key);
+    if (pending_it != ns2_eager_pending_.end()) {
+      // The previous eager load of this texture was never used before this invalidation.
+      Ns2EagerCount(pending_it->second, entry.key, false);
+      ns2_eager_pending_.erase(pending_it);
+    }
+    ns2_in_eager_load_ = true;
+    bool loaded = LoadTextureData(*texture);
+    ns2_in_eager_load_ = false;
+    if (loaded && !(texture->outdated_mask() & Texture::kOutdatedBitBase)) {
+      ++g_ns2_eager_loads;
+      ns2_eager_pending_[entry.key] = start;
+      Ns2AfterEagerLoad(*texture);
+    }
+  }
+}
+
+void TextureCache::Ns2EagerNoteLoad(Texture& texture) {
+  // A regular (draw-time) load of a texture that a recent resolve wrote: learn the pair.
+  const TextureKey& key = texture.key();
+  auto pending_it = ns2_eager_pending_.find(key);
+  if (pending_it != ns2_eager_pending_.end()) {
+    Ns2EagerCount(pending_it->second, key, false);
+    ns2_eager_pending_.erase(pending_it);
+  }
+  if (key.scaled_resolve) {
+    return;
+  }
+  uint32_t base = key.base_page << 12;
+  uint32_t end = base + texture.GetGuestBaseSize();
+  const size_t ring_size = sizeof(ns2_recent_resolves_) / sizeof(ns2_recent_resolves_[0]);
+  for (size_t i = 1; i <= ring_size; ++i) {
+    const Ns2RecentResolve& recent =
+        ns2_recent_resolves_[(ns2_recent_resolve_next_ - i) % ring_size];
+    if (recent.end <= recent.start || recent.start >= end || base >= recent.end) {
+      continue;
+    }
+    std::vector<Ns2EagerEntry>& entries = ns2_eager_entries_[recent.start];
+    for (const Ns2EagerEntry& entry : entries) {
+      if (entry.key == key) {
+        return;
+      }
+    }
+    if (entries.size() < 6) {
+      Ns2EagerEntry entry;
+      entry.key = key;
+      entries.push_back(entry);
+      ++g_ns2_eager_learned;
+    }
+    return;
+  }
+}
+
+void TextureCache::Ns2EagerNoteUse(const Texture& texture) {
+  auto pending_it = ns2_eager_pending_.find(texture.key());
+  if (pending_it != ns2_eager_pending_.end()) {
+    Ns2EagerCount(pending_it->second, texture.key(), true);
+    ns2_eager_pending_.erase(pending_it);
+  }
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -574,6 +719,9 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  if (pending_load.load_base && !ns2_in_eager_load_ && REXCVAR_GET(ns2_eager_texture_loads)) {
+    Ns2EagerNoteLoad(texture);
+  }
   texture.LogAction("Loaded");
   DebugLogTeamProfileBackgroundTextureCandidate("loaded", UINT32_MAX, texture);
 
@@ -642,6 +790,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // A cached texture that is bound again (e.g. one of several FMV frame buffers) may have
       // been rewritten by the CPU since it was last loaded.
       RevalidateTexture(texture, revalidate_now_ms);
+    }
+    if (!ns2_eager_pending_.empty()) {
+      Ns2EagerNoteUse(*texture);
     }
     PendingTextureLoad pending_load;
     PendingSharedMemoryRange pending_ranges[2];
@@ -1523,6 +1674,15 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   texture->LogAction("Created");
   DebugLogTeamProfileBackgroundTextureCandidate("create", UINT32_MAX, *texture);
   return texture;
+}
+
+bool TextureCache::Ns2MakeBaseUpToDate(Texture& texture) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!texture.base_outdated(global_lock) || texture.mips_outdated(global_lock)) {
+    return false;
+  }
+  texture.MakeUpToDateAndWatch(global_lock);
+  return true;
 }
 
 bool TextureCache::LoadTextureData(Texture& texture) {

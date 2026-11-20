@@ -74,6 +74,10 @@
 #include <utility>
 #include <vector>
 
+#if REX_PLATFORM_SWITCH2
+extern "C" bool ns2_debug_enabled();  // platform/windowed_app_main_switch2.cpp
+#endif
+
 namespace rex {
 
 namespace {
@@ -428,11 +432,16 @@ bool ReXApp::SetupEnvironment() {
 
   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
 #if REX_PLATFORM_SWITCH2
-  // Bring-up logging (a config file can override these): every file the game opens, kernel and
-  // thread activity.
-  category_levels.emplace("fs", "trace");
-  category_levels.emplace("krnl", "debug");
-  category_levels.emplace("sys", "debug");
+  if (ns2_debug_enabled()) {
+    // Bring-up logging (a config file can override these): every file the game opens, kernel and
+    // thread activity.
+    category_levels.emplace("fs", "trace");
+    category_levels.emplace("krnl", "debug");
+    category_levels.emplace("sys", "debug");
+  } else if (log_level_str == "info") {
+    // Release default: warnings and errors only (the log file stays tiny).
+    log_level_str = "warn";
+  }
 #endif
   auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
                                         log_level_str, category_levels);

@@ -41,7 +41,444 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, vulkan_transfer_stencil_bits);  // vulkan/render_target_cache.cpp
+
+REXCVAR_DEFINE_BOOL(ns2_rt_valid_tracking, false, "GPU",
+                    "Track which EDRAM tiles each host render target still holds and only transfer "
+                    "the tiles that changed since (render target ping-pong copies back only what "
+                    "the other render target wrote)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(ns2_rt_skip_overwritten_transfers, false, "GPU",
+                    "EXPERIMENTAL: drop ownership transfers of tiles that the draw triggering them "
+                    "fully overwrites (quad-sized draw with depth ALWAYS + write, or opaque color "
+                    "with all channels written, inside its scissor). Wrong if that draw does not "
+                    "cover its scissor or discards pixels")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(ns2_rt_overwrite_max_rects, 1, "GPU",
+                     "ns2_rt_skip_overwritten_transfers: number of rectangles a rectangle-list "
+                     "draw may have to count as a full-target pass (1 = a single rectangle)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(ns2_rt_overwrite_partial_width, false, "GPU",
+                    "ns2_rt_skip_overwritten_transfers: also drop the overwritten part of "
+                    "transfers when the overwriting draw's scissor covers only part of the width "
+                    "(transfers are split per tile row)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
+
+namespace {
+Ns2RtTransferStats g_ns2_rt_transfer_stats;
+// Per (source, destination) pair: what the draws triggering the transfers look like.
+struct Ns2TriggerStats {
+  uint64_t transfers = 0;
+  uint64_t tiles = 0;
+  uint64_t quad = 0;        // quad-sized primitive
+  uint64_t state = 0;       // overwriting depth/colour state
+  uint64_t no_discard = 0;  // no alpha test / alpha to coverage
+  uint64_t like = 0;        // all three
+  uint64_t skipped_tiles = 0;
+  uint32_t last_scissor[4] = {};
+  // Last triggering draw: RB_DEPTHCONTROL (normalized), normalized color mask, prim type << 16 |
+  // index count, RB_COLORCONTROL, RB_BLENDCONTROL of the render target (color destinations).
+  uint32_t last_depth_control = 0;
+  uint32_t last_color_mask = 0;
+  uint32_t last_prim = 0;
+  uint32_t last_color_control = 0;
+  uint32_t last_blend = 0;
+};
+std::unordered_map<uint64_t, Ns2TriggerStats> g_ns2_trigger_stats;
+
+}  // namespace
+
+std::string RenderTargetCache::Ns2DescribeKey(uint32_t key_value) {
+  RenderTargetKey key;
+  key.key = key_value;
+  return fmt::format("{}{}x{}@{}+p{}", key.is_depth ? "D" : "C", uint32_t(key.resource_format),
+                     1u << uint32_t(key.msaa_samples), uint32_t(key.base_tiles),
+                     uint32_t(key.pitch_tiles_at_32bpp));
+}
+
+void Ns2TakeRtTransferStats(Ns2RtTransferStats& out) {
+  out = g_ns2_rt_transfer_stats;
+  g_ns2_rt_transfer_stats = Ns2RtTransferStats();
+}
+
+std::string RenderTargetCache::Ns2TakeTriggerStats() {
+  std::vector<std::pair<uint64_t, Ns2TriggerStats>> sorted(g_ns2_trigger_stats.begin(),
+                                                           g_ns2_trigger_stats.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.second.tiles > b.second.tiles; });
+  std::string text;
+  for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
+    const Ns2TriggerStats& t = sorted[i].second;
+    text += fmt::format(" {}->{} n={} tiles={} quad={} state={} nodiscard={} like={} skipped={} "
+                        "scissor={},{}-{},{} depthctl={:08X} cmask={:04X} prim={:X}/{} "
+                        "colorctl={:08X} blend={:08X}",
+                        Ns2DescribeKey(uint32_t(sorted[i].first >> 32)),
+                        Ns2DescribeKey(uint32_t(sorted[i].first)), t.transfers, t.tiles, t.quad,
+                        t.state, t.no_discard, t.like, t.skipped_tiles, t.last_scissor[0],
+                        t.last_scissor[1], t.last_scissor[2], t.last_scissor[3],
+                        t.last_depth_control, t.last_color_mask, t.last_prim >> 16,
+                        t.last_prim & 0xFFFF, t.last_color_control, t.last_blend);
+  }
+  g_ns2_trigger_stats.clear();
+  return text;
+}
+
+bool RenderTargetCache::Ns2ValidityActive() {
+  bool active =
+      GetPath() == Path::kHostRenderTargets && REXCVAR_GET(ns2_rt_valid_tracking);
+  if (active != ns2_validity_was_active_) {
+    // Switched on or off at runtime: nothing is known to be held until claimed again. Held
+    // version 0 means unknown, so every tile gets a fresh non-zero version.
+    ns2_validity_.clear();
+    ns2_validity_was_active_ = active;
+    uint32_t version = ++ns2_version_counter_;
+    std::fill(std::begin(ns2_tile_version_), std::end(ns2_tile_version_), version);
+  }
+  return active;
+}
+
+RenderTargetCache::Ns2RtValidity& RenderTargetCache::Ns2GetValidity(RenderTargetKey key) {
+  std::unique_ptr<Ns2RtValidity>& validity = ns2_validity_[key.key];
+  if (!validity) {
+    validity = std::make_unique<Ns2RtValidity>();
+    std::memset(validity.get(), 0, sizeof(Ns2RtValidity));
+  }
+  return *validity;
+}
+
+void RenderTargetCache::Ns2PublishPending(RenderTargetKey owner, uint32_t start_tiles,
+                                          uint32_t end_tiles) {
+  if (owner.IsEmpty() || start_tiles >= end_tiles) {
+    return;
+  }
+  Ns2RtValidity& validity = Ns2GetValidity(owner);
+  uint32_t version = 0;
+  uint32_t t = start_tiles;
+  while (t < end_tiles) {
+    uint32_t word = t >> 6;
+    uint32_t word_end = std::min(end_tiles, (word + 1) << 6);
+    uint32_t bit_start = t & 63;
+    uint32_t bit_count = word_end - t;
+    uint64_t mask = bit_count >= 64 ? ~uint64_t(0) : (((uint64_t(1) << bit_count) - 1) << bit_start);
+    uint64_t bits = validity.pending[word] & mask;
+    if (bits) {
+      if (!version) {
+        version = ++ns2_version_counter_;
+      }
+      validity.pending[word] &= ~bits;
+      while (bits) {
+        uint32_t bit = uint32_t(__builtin_ctzll(bits));
+        bits &= bits - 1;
+        uint32_t tile = (word << 6) + bit;
+        ns2_tile_version_[tile] = version;
+        validity.held[tile] = version;
+      }
+    }
+    t = word_end;
+  }
+}
+
+void RenderTargetCache::Ns2MarkHeld(RenderTargetKey key, uint32_t start_tiles,
+                                    uint32_t end_tiles) {
+  if (key.IsEmpty() || start_tiles >= end_tiles) {
+    return;
+  }
+  Ns2RtValidity& validity = Ns2GetValidity(key);
+  for (uint32_t t = start_tiles; t < end_tiles; ++t) {
+    validity.held[t] = ns2_tile_version_[t];
+  }
+}
+
+void RenderTargetCache::Ns2MarkWritten(RenderTargetKey key, uint32_t x0, uint32_t y0, uint32_t x1,
+                                       uint32_t y1, uint32_t claim_start_tiles_base_relative,
+                                       uint32_t claim_length_tiles) {
+  if (key.IsEmpty() || x1 <= x0 || y1 <= y0) {
+    return;
+  }
+  uint32_t tile_width = xenos::kEdramTileWidthSamples >>
+                        (uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X) + uint32_t(key.Is64bpp()));
+  uint32_t tile_height =
+      xenos::kEdramTileHeightSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
+  uint32_t pitch_tiles = key.GetPitchTiles();
+  if (!pitch_tiles) {
+    return;
+  }
+  uint32_t col_start = std::min(x0 / tile_width, pitch_tiles);
+  uint32_t col_end = std::min((x1 + tile_width - 1) / tile_width, pitch_tiles);
+  uint32_t row_start = y0 / tile_height;
+  uint32_t row_end = (y1 + tile_height - 1) / tile_height;
+  if (col_start >= col_end || row_start >= row_end) {
+    return;
+  }
+  ++g_ns2_rt_transfer_stats.write_marks;
+  Ns2RtValidity& validity = Ns2GetValidity(key);
+  uint32_t claim_end = claim_start_tiles_base_relative + claim_length_tiles;
+  for (uint32_t row = row_start; row < row_end; ++row) {
+    uint32_t rel_start = row * pitch_tiles + col_start;
+    uint32_t rel_end = row * pitch_tiles + col_end;
+    if (rel_start >= xenos::kEdramTileCount) {
+      break;
+    }
+    rel_end = std::min(rel_end, xenos::kEdramTileCount);
+    for (uint32_t rel = rel_start; rel < rel_end;) {
+      uint32_t tile = (key.base_tiles + rel) & (xenos::kEdramTileCount - 1);
+      if (rel >= claim_start_tiles_base_relative && rel < claim_end) {
+        // Owned: pending write, published when the owner loses the tile. Set whole words at once.
+        uint32_t run_end = std::min(rel_end, claim_end);
+        // Stop at the EDRAM wrap and at word ends.
+        uint32_t run = std::min(run_end - rel, std::min(xenos::kEdramTileCount - tile,
+                                                        64 - (tile & 63)));
+        uint64_t mask = run >= 64 ? ~uint64_t(0) : (((uint64_t(1) << run) - 1) << (tile & 63));
+        validity.pending[tile >> 6] |= mask;
+        rel += run;
+      } else {
+        // Written outside the claimed range (estimate too small): the image no longer holds it.
+        validity.held[tile] = 0;
+        ++rel;
+      }
+    }
+  }
+}
+
+void RenderTargetCache::Ns2AfterOwnershipUpdate(
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    uint32_t height_used, const RenderTargetKey* rt_keys,
+    const std::pair<uint32_t, uint32_t>* edram_bases_sorted, uint32_t edram_bases_sorted_count,
+    const uint32_t* rt_lengths_tiles) {
+  bool validity = Ns2ValidityActive();
+  bool any_transfers = false;
+  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+    if (!last_update_transfers_[edram_bases_sorted[i].second].empty()) {
+      any_transfers = true;
+      break;
+    }
+  }
+  if (!validity && !any_transfers) {
+    return;
+  }
+  const RegisterFile& regs = register_file();
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor, true);
+  uint32_t x0 = scissor.offset[0];
+  uint32_t y0 = scissor.offset[1];
+  uint32_t x1 = x0 + scissor.extent[0];
+  uint32_t y1 = std::min(y0 + scissor.extent[1], height_used);
+  uint32_t surface_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+
+  // Whether the draw looks like a full-rectangle pass (a quad covering its scissor) that can't
+  // discard pixels in the fixed-function stages.
+  bool quad_like = false;
+  bool no_discard = false;
+  if (any_transfers) {
+    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    uint32_t index_count = vgt_draw_initiator.num_indices;
+    switch (vgt_draw_initiator.prim_type) {
+      case xenos::PrimitiveType::kRectangleList:
+        quad_like = index_count <=
+                    3 * uint32_t(std::max(1, int(REXCVAR_GET(ns2_rt_overwrite_max_rects))));
+        break;
+      case xenos::PrimitiveType::kTriangleStrip:
+      case xenos::PrimitiveType::kTriangleFan:
+      case xenos::PrimitiveType::kQuadList:
+        quad_like = index_count <= 4;
+        break;
+      case xenos::PrimitiveType::kTriangleList:
+        quad_like = index_count <= 6;
+        break;
+      default:
+        break;
+    }
+    auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+    no_discard = (!rb_colorcontrol.alpha_test_enable ||
+                  rb_colorcontrol.alpha_func == xenos::CompareFunction::kAlways) &&
+                 !rb_colorcontrol.alpha_to_mask_enable;
+  }
+  bool depth_passes_all = !normalized_depth_control.z_enable ||
+                          normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
+  // Stencil: off, or a test that always passes (front, and back if separate).
+  bool stencil_passes_all =
+      !normalized_depth_control.stencil_enable ||
+      (normalized_depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+       (!normalized_depth_control.backface_enable ||
+        normalized_depth_control.stencilfunc_bf == xenos::CompareFunction::kAlways));
+  // Whether every covered sample gets a stencil value independent of the previous one (or
+  // stencil isn't used): with depth always passing, only the z-pass operation applies. With
+  // vulkan_transfer_stencil_bits off, transfers don't carry stencil anyway (it's cleared to 0),
+  // so a partial write mask loses nothing that the transfer would have kept.
+  bool stencil_overwritten = !normalized_depth_control.stencil_enable;
+  if (normalized_depth_control.stencil_enable && stencil_passes_all && depth_passes_all) {
+    auto overwrites_op = [](xenos::StencilOp op) {
+      return op == xenos::StencilOp::kReplace || op == xenos::StencilOp::kZero;
+    };
+    bool ops = overwrites_op(normalized_depth_control.stencilzpass) &&
+               (!normalized_depth_control.backface_enable ||
+                overwrites_op(normalized_depth_control.stencilzpass_bf));
+    bool masks = !REXCVAR_GET(vulkan_transfer_stencil_bits) ||
+                 (regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask == 0xFF &&
+                  (!normalized_depth_control.backface_enable ||
+                   regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)
+                           .stencilwritemask == 0xFF));
+    stencil_overwritten = ops && masks;
+  }
+  bool overwrite_skip = REXCVAR_GET(ns2_rt_skip_overwritten_transfers);
+
+  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+    uint32_t rt_bit_index = edram_bases_sorted[i].second;
+    const RenderTargetKey& key = rt_keys[rt_bit_index];
+    bool may_write;
+    bool overwrites;
+    if (rt_bit_index == 0) {
+      may_write = (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
+                  normalized_depth_control.stencil_enable;
+      overwrites = normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+                   normalized_depth_control.zfunc == xenos::CompareFunction::kAlways &&
+                   stencil_overwritten;
+    } else {
+      uint32_t color_mask = (normalized_color_mask >> ((rt_bit_index - 1) * 4)) & 0xF;
+      may_write = color_mask != 0;
+      overwrites = false;
+      if (any_transfers && color_mask == 0xF && depth_passes_all && stencil_passes_all) {
+        auto blend = regs.Get<reg::RB_BLENDCONTROL>(
+            reg::RB_BLENDCONTROL::rt_register_indices[rt_bit_index - 1]);
+        overwrites = blend.color_srcblend == xenos::BlendFactor::kOne &&
+                     blend.color_destblend == xenos::BlendFactor::kZero &&
+                     blend.color_comb_fcn == xenos::BlendOp::kAdd &&
+                     blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+                     blend.alpha_destblend == xenos::BlendFactor::kZero &&
+                     blend.alpha_comb_fcn == xenos::BlendOp::kAdd;
+      }
+    }
+    std::vector<Transfer>& transfers = last_update_transfers_[rt_bit_index];
+    Ns2TriggerStats* trigger_stats = nullptr;
+    if (!transfers.empty()) {
+      // Statistics per pair (of the first transfer source; usually the only one).
+      trigger_stats =
+          &g_ns2_trigger_stats[(uint64_t(transfers.front().source->key().key) << 32) | key.key];
+      for (const Transfer& transfer : transfers) {
+        ++trigger_stats->transfers;
+        trigger_stats->tiles += transfer.end_tiles - transfer.start_tiles;
+      }
+      trigger_stats->quad += quad_like;
+      trigger_stats->state += overwrites;
+      trigger_stats->no_discard += no_discard;
+      trigger_stats->like += overwrites && quad_like && no_discard;
+      trigger_stats->last_scissor[0] = x0;
+      trigger_stats->last_scissor[1] = y0;
+      trigger_stats->last_scissor[2] = x1;
+      trigger_stats->last_scissor[3] = y1;
+      trigger_stats->last_depth_control = normalized_depth_control.value;
+      trigger_stats->last_color_mask = normalized_color_mask;
+      auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+      trigger_stats->last_prim = (uint32_t(vgt_draw_initiator.prim_type) << 16) |
+                                 uint32_t(vgt_draw_initiator.num_indices);
+      trigger_stats->last_color_control = regs.Get<reg::RB_COLORCONTROL>().value;
+      trigger_stats->last_blend =
+          rt_bit_index ? regs.Get<reg::RB_BLENDCONTROL>(
+                             reg::RB_BLENDCONTROL::rt_register_indices[rt_bit_index - 1])
+                             .value
+                       : 0;
+    }
+    if (!transfers.empty() && overwrites && quad_like && no_discard) {
+      g_ns2_rt_transfer_stats.overwrite_like_transfers += transfers.size();
+      if (overwrite_skip) {
+        // Tiles fully inside the scissor rectangle (padding beyond the surface pitch counts as
+        // covered: the guest can't address it).
+        uint32_t tile_width =
+            xenos::kEdramTileWidthSamples >>
+            (uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X) + uint32_t(key.Is64bpp()));
+        uint32_t tile_height =
+            xenos::kEdramTileHeightSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
+        uint32_t pitch_tiles = key.GetPitchTiles();
+        uint32_t col_start = (x0 + tile_width - 1) / tile_width;
+        uint32_t col_end = x1 >= surface_pitch ? pitch_tiles : std::min(x1 / tile_width, pitch_tiles);
+        uint32_t row_start = (y0 + tile_height - 1) / tile_height;
+        uint32_t row_end = y1 / tile_height;
+        if (pitch_tiles && col_start < col_end && row_start < row_end) {
+          bool full_width = col_start == 0 && col_end == pitch_tiles;
+          std::vector<Transfer> kept;
+          kept.reserve(transfers.size() + 1);
+          for (const Transfer& transfer : transfers) {
+            uint32_t rel_start =
+                (transfer.start_tiles - key.base_tiles) & (xenos::kEdramTileCount - 1);
+            uint32_t rel_end = rel_start + (transfer.end_tiles - transfer.start_tiles);
+            if (full_width) {
+              uint32_t cover_start = row_start * pitch_tiles;
+              uint32_t cover_end = row_end * pitch_tiles;
+              uint32_t overlap_start = std::max(rel_start, cover_start);
+              uint32_t overlap_end = std::min(rel_end, cover_end);
+              if (overlap_start >= overlap_end) {
+                kept.push_back(transfer);
+                continue;
+              }
+              g_ns2_rt_transfer_stats.overwrite_skipped_tiles += overlap_end - overlap_start;
+              trigger_stats->skipped_tiles += overlap_end - overlap_start;
+              if (rel_start < overlap_start) {
+                kept.emplace_back(transfer.start_tiles,
+                                  transfer.start_tiles + (overlap_start - rel_start),
+                                  transfer.source, transfer.host_depth_source);
+              }
+              if (overlap_end < rel_end) {
+                kept.emplace_back(transfer.start_tiles + (overlap_end - rel_start),
+                                  transfer.end_tiles, transfer.source,
+                                  transfer.host_depth_source);
+              }
+            } else if (REXCVAR_GET(ns2_rt_overwrite_partial_width)) {
+              // Remove the covered column span from every covered row, keeping the rest as
+              // (merged) pieces.
+              uint32_t piece_start = rel_start;
+              uint32_t removed = 0;
+              uint32_t first_row = rel_start / pitch_tiles;
+              uint32_t last_row = (rel_end - 1) / pitch_tiles;
+              for (uint32_t row = std::max(first_row, row_start);
+                   row <= last_row && row < row_end; ++row) {
+                uint32_t cover_start = std::max(rel_start, row * pitch_tiles + col_start);
+                uint32_t cover_end = std::min(rel_end, row * pitch_tiles + col_end);
+                if (cover_start >= cover_end) {
+                  continue;
+                }
+                if (piece_start < cover_start) {
+                  kept.emplace_back(transfer.start_tiles + (piece_start - rel_start),
+                                    transfer.start_tiles + (cover_start - rel_start),
+                                    transfer.source, transfer.host_depth_source);
+                }
+                removed += cover_end - cover_start;
+                piece_start = cover_end;
+              }
+              if (piece_start < rel_end) {
+                kept.emplace_back(transfer.start_tiles + (piece_start - rel_start),
+                                  transfer.end_tiles, transfer.source,
+                                  transfer.host_depth_source);
+              }
+              g_ns2_rt_transfer_stats.overwrite_skipped_tiles += removed;
+              trigger_stats->skipped_tiles += removed;
+            } else {
+              uint32_t row = rel_start / pitch_tiles;
+              bool inside = row >= row_start && row < row_end &&
+                            (rel_end - 1) / pitch_tiles == row &&
+                            rel_start - row * pitch_tiles >= col_start &&
+                            rel_end - row * pitch_tiles <= col_end;
+              if (inside) {
+                g_ns2_rt_transfer_stats.overwrite_skipped_tiles += rel_end - rel_start;
+                trigger_stats->skipped_tiles += rel_end - rel_start;
+              } else {
+                kept.push_back(transfer);
+              }
+            }
+          }
+          transfers.swap(kept);
+        }
+      }
+    }
+    if (validity && may_write) {
+      Ns2MarkWritten(key, x0, y0, x1, y1, 0, rt_lengths_tiles[i]);
+    }
+  }
+}
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
                                               uint32_t write_mask, float& clamp_rgb_low,
@@ -342,6 +779,7 @@ void RenderTargetCache::InitializeCommon() {
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
   ownership_ranges_.clear();
+  ns2_validity_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                               std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -385,6 +823,7 @@ void RenderTargetCache::ClearCache() {
           continue;
         }
         if (used_render_targets.find(it->second->key()) == used_render_targets.end()) {
+          ns2_validity_.erase(it->second->key().key);
           delete it->second;
           render_targets_.erase(it);
         }
@@ -688,6 +1127,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     uint32_t rt_bit_index = rt_base_index.second;
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
                     interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+  }
+
+  if (!interlock_barrier_only) {
+    Ns2AfterOwnershipUpdate(normalized_depth_control, normalized_color_mask, height_used, rt_keys,
+                            edram_bases_sorted, edram_bases_sorted_count, rt_lengths_tiles);
   }
 
   if (interlock_barrier_only) {
@@ -1121,6 +1565,21 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     ChangeOwnership(color_render_target_key, color_clear_start_tiles_base_relative,
                     color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
   }
+  if (Ns2ValidityActive()) {
+    // The clear writes the owners' images.
+    uint32_t clear_x1 = clear_rectangle.x_pixels + clear_rectangle.width_pixels;
+    uint32_t clear_y1 = clear_rectangle.y_pixels + clear_rectangle.height_pixels;
+    if (depth_render_target) {
+      Ns2MarkWritten(depth_render_target_key, clear_rectangle.x_pixels, clear_rectangle.y_pixels,
+                     clear_x1, clear_y1, depth_clear_start_tiles_base_relative,
+                     depth_clear_length_tiles);
+    }
+    if (color_render_target) {
+      Ns2MarkWritten(color_render_target_key, clear_rectangle.x_pixels, clear_rectangle.y_pixels,
+                     clear_x1, clear_y1, color_clear_start_tiles_base_relative,
+                     color_clear_length_tiles);
+    }
+  }
   return true;
 }
 
@@ -1156,6 +1615,7 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
   // Change ownership, but don't transfer the contents - they will be replaced
   // anyway.
   ownership_ranges_.clear();
+  ns2_validity_.clear();
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, render_target_key,
                                                   RenderTargetKey(), RenderTargetKey()));
@@ -1190,6 +1650,8 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     render_target = it_rt->second;
   } else {
     render_target = CreateRenderTarget(key);
+    // A new image holds nothing.
+    ns2_validity_.erase(key.key);
     uint32_t width = key.GetWidth();
     uint32_t height = GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
     if (render_target) {
@@ -1290,6 +1752,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+  // Transfers are only produced on the host render target path (transfers_append_out != null).
+  bool validity_active = transfers_append_out && Ns2ValidityActive();
   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
     // The map contains consecutive ranges, merged if the adjacent ones are the
     // same. Find the range starting at >= the start. A portion of the range
@@ -1329,25 +1793,29 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       }
       if (transfers_append_out) {
         RenderTargetKey transfer_source = it->second.render_target;
+        uint32_t range_end_tiles = std::min(it->second.end_tiles, extent_end);
         // Only perform the copying when actually changing the latest owner, not
         // just the latest host depth owner - the transfer source is expected to
         // be different than the destination.
         if (!transfer_source.IsEmpty() && transfer_source != dest) {
-          uint32_t transfer_end_tiles = std::min(it->second.end_tiles, extent_end);
-          if (!resolve_clear_cutout ||
-              Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
-                                           dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
-                                           nullptr, resolve_clear_cutout)) {
-            RenderTargetKey transfer_host_depth_source =
-                host_depth_encoding_different
-                    ? it->second.GetHostDepthRenderTarget(dest.GetDepthFormat())
-                    : RenderTargetKey();
-            if (transfer_host_depth_source == transfer_source) {
-              // Same render target, don't provide a separate host depth source.
-              transfer_host_depth_source = RenderTargetKey();
+          RenderTargetKey transfer_host_depth_source =
+              host_depth_encoding_different
+                  ? it->second.GetHostDepthRenderTarget(dest.GetDepthFormat())
+                  : RenderTargetKey();
+          if (transfer_host_depth_source == transfer_source) {
+            // Same render target, don't provide a separate host depth source.
+            transfer_host_depth_source = RenderTargetKey();
+          }
+          auto emit_transfer = [&](uint32_t transfer_start_tiles, uint32_t transfer_end_tiles) {
+            if (resolve_clear_cutout &&
+                !Transfer::GetRangeRectangles(transfer_start_tiles, transfer_end_tiles,
+                                              dest.base_tiles, dest_pitch_tiles,
+                                              dest.msaa_samples, dest_is_64bpp, nullptr,
+                                              resolve_clear_cutout)) {
+              return;
             }
             if (!transfers_append_out->empty() &&
-                transfers_append_out->back().end_tiles == it->first &&
+                transfers_append_out->back().end_tiles == transfer_start_tiles &&
                 transfers_append_out->back().source->key() == transfer_source &&
                 ((transfers_append_out->back().host_depth_source == nullptr) ==
                  transfer_host_depth_source.IsEmpty()) &&
@@ -1370,14 +1838,51 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                   assert_false(transfer_host_depth_source_rt_it != render_targets_.end() &&
                                !transfer_host_depth_source_rt_it->second);
                   transfers_append_out->emplace_back(
-                      it->first, transfer_end_tiles, transfer_source_rt_it->second,
+                      transfer_start_tiles, transfer_end_tiles, transfer_source_rt_it->second,
                       transfer_host_depth_source_rt_it != render_targets_.end()
                           ? transfer_host_depth_source_rt_it->second
                           : nullptr);
                 }
               }
             }
+          };
+          ++g_ns2_rt_transfer_stats.candidate_ranges;
+          g_ns2_rt_transfer_stats.candidate_tiles += range_end_tiles - it->first;
+          if (validity_active) {
+            // The source's writes in this range become the current contents; transfer only the
+            // runs of tiles whose current contents the destination's image doesn't hold.
+            Ns2PublishPending(transfer_source, it->first, range_end_tiles);
+            const Ns2RtValidity& dest_validity = Ns2GetValidity(dest);
+            uint32_t skipped_tiles = 0;
+            uint32_t run_start = UINT32_MAX;
+            for (uint32_t t = it->first; t < range_end_tiles; ++t) {
+              bool stale = dest_validity.held[t] != ns2_tile_version_[t];
+              if (stale) {
+                if (run_start == UINT32_MAX) {
+                  run_start = t;
+                }
+              } else {
+                ++skipped_tiles;
+                if (run_start != UINT32_MAX) {
+                  emit_transfer(run_start, t);
+                  run_start = UINT32_MAX;
+                }
+              }
+            }
+            if (run_start != UINT32_MAX) {
+              emit_transfer(run_start, range_end_tiles);
+            }
+            g_ns2_rt_transfer_stats.valid_skipped_tiles += skipped_tiles;
+            if (skipped_tiles == range_end_tiles - it->first) {
+              ++g_ns2_rt_transfer_stats.valid_skipped_ranges;
+            }
+          } else {
+            emit_transfer(it->first, range_end_tiles);
           }
+        }
+        if (validity_active) {
+          // Owner from now on (after the transfer): the image holds the current contents.
+          Ns2MarkHeld(dest, it->first, range_end_tiles);
         }
       }
       // Claim the current range.

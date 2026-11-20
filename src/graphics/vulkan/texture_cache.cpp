@@ -71,10 +71,19 @@ REXCVAR_DEFINE_BOOL(vulkan_storage_image_texture_loads_unscaled, false, "GPU/Vul
                     "textures, e.g. render-to-texture images reloaded every frame")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(ns2_resolve_to_texture, false, "GPU/Vulkan",
+                    "Raw 32bpp k_8_8_8_8 resolves of single-sampled render targets also copy the "
+                    "pixels straight from the render target image into the cached textures they "
+                    "fully cover, which are then not reloaded from memory (render-to-texture "
+                    "without the load dispatch). The memory still receives the resolve")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 #if REX_PLATFORM_SWITCH2
 namespace rex::graphics {
 void Ns2RecordTextureLoad(uint32_t base, uint32_t size, uint32_t width, uint32_t height,
                           uint32_t format, bool hash_changed_recently);
+void Ns2RecordResolveTextureCopy(uint32_t bytes);
+void Ns2RecordTextureLoadInPass();
 }  // namespace rex::graphics
 #endif
 
@@ -1778,6 +1787,153 @@ VkDescriptorSet VulkanTextureCache::GetLoadSourceTexelBufferDescriptorSet(VkBuff
   return descriptor_set;
 }
 
+void VulkanTextureCache::Ns2AfterEagerLoad(Texture& texture) {
+  // Transition for guest shader sampling now: the barrier joins the ones submitted when the next
+  // render pass begins after the resolve, rather than breaking a later render pass.
+  VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+  VulkanTexture::Usage old_usage =
+      vulkan_texture.SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
+  if (old_usage == VulkanTexture::Usage::kGuestShaderSampled) {
+    return;
+  }
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  VkImageLayout old_layout, new_layout;
+  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+  GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled, dst_stage_mask, dst_access_mask,
+                       new_layout);
+  command_processor_.PushImageMemoryBarrier(vulkan_texture.image(),
+                                            ui::vulkan::util::InitializeSubresourceRange(),
+                                            src_stage_mask, dst_stage_mask, src_access_mask,
+                                            dst_access_mask, old_layout, new_layout);
+}
+
+void VulkanTextureCache::Ns2IndexResolveTexture(const VulkanTexture& texture) {
+  const TextureKey& key = texture.key();
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || !key.tiled || key.scaled_resolve ||
+      key.format != xenos::TextureFormat::k_8_8_8_8 || key.mip_max_level != 0 ||
+      key.GetDepthOrArraySize() != 1 || !key.base_page ||
+      texture.guest_layout().packed_level == 0) {
+    static int logs_remaining = 24;
+    if (key.format == xenos::TextureFormat::k_8_8_8_8 && logs_remaining > 0) {
+      --logs_remaining;
+      REXGPU_INFO("ns2_resolve_to_texture: not indexed {:08X} {}x{}x{} dim={} tiled={} scaled={} "
+                  "mips={} packed_level={}",
+                  key.base_page << 12, key.GetWidth(), key.GetHeight(),
+                  key.GetDepthOrArraySize(), uint32_t(key.dimension), uint32_t(key.tiled),
+                  uint32_t(key.scaled_resolve), uint32_t(key.mip_max_level),
+                  texture.guest_layout().packed_level);
+    }
+    return;
+  }
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  bool is_signed = IsSignedVersionSeparateForFormat(key)
+                       ? bool(key.signed_separate)
+                       : host_format_pair.format_unsigned.load_shader == kLoadShaderIndexUnknown;
+  const HostFormat& host_format =
+      is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned;
+  if (host_format.load_shader != kLoadShaderIndex32bpb ||
+      (host_format.format != VK_FORMAT_R8G8B8A8_UNORM &&
+       host_format.format != VK_FORMAT_R8G8B8A8_SNORM)) {
+    return;
+  }
+  std::vector<TextureKey>& keys = ns2_resolve_texture_keys_[key.base_page << 12];
+  if (std::find(keys.begin(), keys.end(), key) != keys.end()) {
+    return;
+  }
+  if (keys.size() >= 8) {
+    keys.erase(keys.begin());
+  }
+  keys.push_back(key);
+}
+
+uint32_t VulkanTextureCache::Ns2CopyResolveToTextures(uint32_t dest_base,
+                                                      uint32_t dest_pitch_div_32,
+                                                      uint32_t dest_endian, uint32_t width,
+                                                      uint32_t height, VkImage source_image,
+                                                      int32_t source_x, int32_t source_y,
+                                                      const std::function<void()>& prepare_source,
+                                                      uint32_t& reason_out,
+                                                      std::string& detail_out) {
+  reason_out = 1;
+  auto keys_it = ns2_resolve_texture_keys_.find(dest_base);
+  if (keys_it == ns2_resolve_texture_keys_.end()) {
+    return 0;
+  }
+  std::vector<TextureKey>& keys = keys_it->second;
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  uint32_t written = 0;
+  for (size_t i = 0; i < keys.size();) {
+    const TextureKey key = keys[i];
+    Texture* texture = Ns2FindExistingTexture(key);
+    if (!texture) {
+      // Evicted.
+      keys.erase(keys.begin() + i);
+      continue;
+    }
+    ++i;
+    if (key.pitch != dest_pitch_div_32 || uint32_t(key.endianness) != dest_endian ||
+        key.GetWidth() > width || key.GetHeight() > height) {
+      if (reason_out < 2) {
+        reason_out = 2;
+        detail_out = fmt::format("tex {}x{} pitch32={} endian={} vs resolve {}x{} pitch32={} "
+                                 "endian={}",
+                                 key.GetWidth(), key.GetHeight(), uint32_t(key.pitch),
+                                 uint32_t(key.endianness), width, height, dest_pitch_div_32,
+                                 dest_endian);
+      }
+      continue;
+    }
+    // Only replace a reload that is actually pending (the resolve just invalidated the base).
+    if (!(texture->outdated_mask() & Texture::kOutdatedBitBase)) {
+      reason_out = std::max(reason_out, uint32_t(3));
+      continue;
+    }
+    VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(*texture);
+    if (!written) {
+      command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kTextureUploadCopy);
+      prepare_source();
+    }
+    vulkan_texture.MarkAsUsed();
+    VulkanTexture::Usage texture_old_usage =
+        vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+    if (texture_old_usage != VulkanTexture::Usage::kTransferDestination) {
+      VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
+      VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
+      VkImageLayout texture_old_layout, texture_new_layout;
+      GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
+                           texture_old_layout);
+      GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
+                           texture_dst_access_mask, texture_new_layout);
+      command_processor_.PushImageMemoryBarrier(
+          vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+          texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+          texture_dst_access_mask, texture_old_layout, texture_new_layout);
+    }
+    command_processor_.SubmitBarriers(true);
+    VkImageCopy region;
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.mipLevel = 0;
+    region.srcSubresource.baseArrayLayer = 0;
+    region.srcSubresource.layerCount = 1;
+    region.srcOffset = {source_x, source_y, 0};
+    region.dstSubresource = region.srcSubresource;
+    region.dstOffset = {0, 0, 0};
+    region.extent = {key.GetWidth(), key.GetHeight(), 1};
+    command_buffer.CmdVkCopyImage(source_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                  &region);
+    reason_out = std::max(reason_out, uint32_t(4));
+    if (Ns2MakeBaseUpToDate(*texture)) {
+      ++written;
+#if REX_PLATFORM_SWITCH2
+      Ns2RecordResolveTextureCopy(key.GetWidth() * key.GetHeight() * 4);
+#endif
+    }
+  }
+  return written;
+}
+
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
@@ -1793,6 +1949,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                    : vulkan_texture.GetGuestMipsSize(),
                          texture_key.GetWidth(), texture_key.GetHeight(),
                          uint32_t(texture_key.format), hash_changed);
+  }
+#endif
+  if (load_base && REXCVAR_GET(ns2_resolve_to_texture)) {
+    Ns2IndexResolveTexture(vulkan_texture);
+  }
+#if REX_PLATFORM_SWITCH2
+  if (command_processor_.ns2_in_render_pass()) {
+    Ns2RecordTextureLoadInPass();
   }
 #endif
 

@@ -567,6 +567,41 @@ class TextureCache {
     return load_shader_info_[load_shader_index];
   }
   bool LoadTextureData(Texture& texture);
+
+  // Switch 2 (ns2_resolve_to_texture): look up an existing texture without creating it, and mark
+  // a texture whose base level was written directly by the GPU as up to date (watching its memory
+  // again). Returns false if the base was not outdated.
+  Texture* Ns2FindExistingTexture(const TextureKey& key) const {
+    auto it = textures_.find(key);
+    return it != textures_.end() ? it->second.get() : nullptr;
+  }
+  bool Ns2MakeBaseUpToDate(Texture& texture);
+
+  // ns2_eager_texture_loads (Switch 2): textures that are reloaded after a resolve to an address
+  // are learned per resolve address and reloaded right after that resolve (where the render pass
+  // is already broken for the resolve) instead of in the middle of a later render pass. An entry
+  // whose eager loads keep going unused before the next invalidation stops being loaded eagerly.
+  struct Ns2EagerEntry {
+    TextureKey key;
+    uint32_t hits = 0;
+    uint32_t wastes = 0;
+  };
+  struct Ns2RecentResolve {
+    uint32_t start = 0;
+    uint32_t end = 0;
+  };
+  void Ns2EagerLoadAfterResolve(uint32_t start, uint32_t length);
+  void Ns2EagerNoteLoad(Texture& texture);
+  void Ns2EagerNoteUse(const Texture& texture);
+  void Ns2EagerCount(uint32_t resolve_start, const TextureKey& key, bool hit);
+  // Called after an eager load: the implementation can transition the texture for sampling now.
+  virtual void Ns2AfterEagerLoad(Texture& texture) {}
+  Ns2RecentResolve ns2_recent_resolves_[16];
+  uint32_t ns2_recent_resolve_next_ = 0;
+  std::unordered_map<uint32_t, std::vector<Ns2EagerEntry>> ns2_eager_entries_;
+  // Eagerly loaded textures not used by a draw yet -> the resolve address that loaded them.
+  std::unordered_map<TextureKey, uint32_t, TextureKey::Hasher> ns2_eager_pending_;
+  bool ns2_in_eager_load_ = false;
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data

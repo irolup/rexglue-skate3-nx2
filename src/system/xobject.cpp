@@ -38,6 +38,7 @@ namespace rex::system {
 
 #if REX_PLATFORM_SWITCH2
 void CheckKernelDispatchHealth();  // kernel_state.cpp
+extern "C" bool ns2_debug_enabled();  // platform/windowed_app_main_switch2.cpp
 // Long-wait report (diagnostics for hangs where every thread sits in a wait): each guest thread
 // records the objects it waits on in a thread-local slot; a monitor thread logs every wait that
 // lasts more than 5 s (once per wait), with the waiting thread and the object types/handles.
@@ -107,21 +108,30 @@ WaitSlot& CurrentWaitSlot(KernelState* kernel_state) {
 }
 
 struct ScopedWaitRecord {
-  WaitSlot& slot;
+  bool active;
+  WaitSlot* slot = nullptr;
   ScopedWaitRecord(KernelState* kernel_state, XObject* const* objects, uint32_t count,
                    bool wait_all, bool infinite)
-      : slot(CurrentWaitSlot(kernel_state)) {
-    slot.count = count;
-    for (uint32_t i = 0; i < count && i < 4; ++i) {
-      slot.handles[i] = objects[i]->handle();
-      slot.types[i] = uint32_t(objects[i]->type());
+      : active(ns2_debug_enabled()) {
+    if (!active) {
+      return;
     }
-    slot.wait_all = wait_all;
-    slot.infinite = infinite;
-    slot.serial.fetch_add(1, std::memory_order_release);
-    slot.start_ms.store(chrono::Clock::QueryHostUptimeMillis() | 1, std::memory_order_release);
+    slot = &CurrentWaitSlot(kernel_state);
+    slot->count = count;
+    for (uint32_t i = 0; i < count && i < 4; ++i) {
+      slot->handles[i] = objects[i]->handle();
+      slot->types[i] = uint32_t(objects[i]->type());
+    }
+    slot->wait_all = wait_all;
+    slot->infinite = infinite;
+    slot->serial.fetch_add(1, std::memory_order_release);
+    slot->start_ms.store(chrono::Clock::QueryHostUptimeMillis() | 1, std::memory_order_release);
   }
-  ~ScopedWaitRecord() { slot.start_ms.store(0, std::memory_order_release); }
+  ~ScopedWaitRecord() {
+    if (active) {
+      slot->start_ms.store(0, std::memory_order_release);
+    }
+  }
 };
 }  // namespace
 #define REX_RECORD_WAIT(ks, objs, n, all, infinite) \
